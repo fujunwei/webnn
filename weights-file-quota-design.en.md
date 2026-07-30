@@ -338,159 +338,237 @@ WebNN does not use true preallocation (`fallocate` / `SetEndOfFile`) for the rea
 
 ---
 
-## 5. Followup CL: cross-platform fd-level hard cap
+## 5. Capacity tracker: renderer holds writable fd, sync IPC before each extension
+
+> **Design evolution (2026-06-17 update)**
+>
+> This section originally chased a "kernel-enforced fd-level hard cap", first via chunked SharedMemory (commit `2881a74236`, now abandoned). The motivation was to elevate §A/§B/§C from bookkeeping to kernel enforcement.
+>
+> That starting premise was wrong: **the FSA picker is not a security boundary**. File System Access gives the renderer a writable fd directly to a user-chosen file. Security comes from two *independent* layers: (1) the user authorizes through the picker which byte-streams this origin may touch — a *privacy* boundary; (2) `FileSystemAccessCapacityTracker` does **incremental accounting** in the browser process — a *resource-exhaustion* boundary. The two layers are orthogonal: the picker stops a malicious page from reading your private files; the capacity tracker stops it from filling the disk. Neither substitutes for the other.
+>
+> The key observation: **OPFS (Origin Private File System) follows exactly the same picker-less path.** A `FileSystemSyncAccessHandle` requires no user authorization dialog; the origin gets its private filesystem automatically, the renderer still holds a writable fd, and it still goes through the same [`FileSystemAccessCapacityTracker`](https://source.chromium.org/chromium/chromium/src/+/main:third_party/blink/renderer/modules/file_system_access/file_system_access_capacity_tracker.cc) for capacity accounting. OPFS security comes 100% from the browser-side capacity tracker — **no picker required**.
+>
+> Mapping this to WebNN: the weights tempfile is browser-created, origin-private, lifetime-bound to the context, never exposed to the user or other origins — the same shape as an OPFS sandbox file. WebNN doesn't need a picker; it needs **the OPFS-equivalent capacity tracker** — renderer holds the writable fd, calls `RequestCapacityChange(new_size)` before each extension, and the browser re-runs §A disk headroom + §B per-context cap + §C per-origin cap + §D `fstat` anti-tamper on every IPC. Safety comes from *incremental, mandatory, un-bypassable* enforcement at the IPC boundary, not from the fd type.
+>
+> The old chunked-SHM implementation (commit `2881a74236`) is replaced by this design.
 
 ### 5.1 Problem
 
-§A / §B / §C are all **bookkeeping-style** defenses: the browser trusts in-renderer TFLite/LiteRT not to write more than `required_bytes`. A compromised renderer can `CreateWeightsFile(required_bytes = 1)`, pass every upper-layer check, and then `write()` arbitrary bytes to the returned writable fd — at worst, up to the §C cap minus headroom.
+The original `CreateWeightsFile(required_bytes)` was one-shot bookkeeping: the browser runs §A/§B/§C once before handing out the fd, and after that the fd is in the renderer with no per-fd limit. A compromised renderer can call `CreateWeightsFile(required_bytes=1)`, pass all upper-layer checks, and then `write()` arbitrary bytes to the fd — up to ENOSPC — without ever calling `RequestCapacityChange`.
 
-POSIX has no per-fd write-byte quota (`RLIMIT_FSIZE` is process-wide). Linux can place a hard cap on an fd via `memfd_create` + `F_SEAL_GROW`, but **Windows and macOS have no equivalent** — any writable file handle can `SetEndOfFile` / `ftruncate` to grow the file.
+A secondary problem (raised by reillyg@): streaming weights require that `build()` can start without knowing the total weight size in advance, but `CreateWeightsFile(required_bytes)` requires that total upfront.
 
-`base::WritableSharedMemoryRegion` is a natural cross-platform hard cap:
+### 5.2 Security model: picker and capacity tracker are independent layers
 
-| Platform | Backing | Cap enforcement |
-|---|---|---|
-| Linux / Android / ChromeOS | `memfd_create` + `F_SEAL_SHRINK \| F_SEAL_GROW` | Kernel refuses to grow; out-of-bounds write yields `SIGBUS` |
-| Windows | Named section (pagefile-backed), `CreateFileMapping(SECTION_QUERY \| FILE_MAP_WRITE)` | Section size is fixed at creation; OOB access = access violation |
-| macOS | Mach VM region / POSIX shm | Size fixed at creation; OOB access = `EXC_BAD_ACCESS` |
+| Dimension | FSA picker file | OPFS sandbox file | WebNN weights tempfile |
+|---|---|---|---|
+| User authorization layer | Picker selects the specific file (privacy) | No picker (origin gets it automatically) | No picker (service creates it) |
+| Who holds the writable fd | Renderer | Renderer | Renderer (in-renderer TFLite/LiteRT) |
+| Sync IPC check before each extension | ✅ `FileSystemAccessCapacityTracker.RequestFileCapacityChangeSync` | ✅ Same tracker class | ✅ `WeightsFileCapacityHost.RequestCapacityChange` |
+| Resource-exhaustion defense layer | Browser-process capacity tracker | Browser-process capacity tracker | Browser-process §A/§B/§C/§D (this design) |
+| File lifetime | User file, survives origin unload | Origin-private, cleared with origin | Context-bound, unlinked on pipe close |
+| Cross-origin read exposure | Picker prevents it | OPFS isolation prevents it | fd never leaves service↔renderer channel |
 
-No per-platform code branching: `base::WritableSharedMemoryRegion::Create(N)` does the right syscall on each platform; the renderer's `WritableSharedMemoryMapping::GetMemoryAsSpan<uint8_t>()` returns a span of size `N`, and out-of-bounds accesses are enforced by the kernel.
+WebNN resembles OPFS more than FSA picker files: picker-less, origin-internal, user-agent-created. Safety comes entirely from browser-side incremental accounting.
 
-### 5.2 Why a single region won't work above 2 GiB: chunking is required
+> **GPU-process path is out of scope here.** The LiteRT GPU delegate runs in the GPU process, uses `viz::mojom::GpuHost::CreateWebNNWeightsFile` to create its fd, and never hands that fd to the renderer — no fd out-of-bounds write threat. Its limits are §A disk headroom + §B per-context self-check. The capacity tracker only covers the in-renderer TFLite/LiteRT path.
 
-`base::PlatformSharedMemoryRegion::Create()` hard-codes an `INT_MAX` ceiling on every platform:
+### 5.3 Design
 
-| Platform | File | Check |
-|---|---|---|
-| POSIX (Linux/CrOS) | `base/memory/platform_shared_memory_region_posix.cc:183` | `if (size > std::numeric_limits<int>::max()) return {};` |
-| Android | `..._android.cc:53,138` | Same; `rounded_size` is checked again after page-align |
-| macOS | `..._apple.cc:30` | Same |
-| Windows | `..._win.cc` | Same |
-
-`std::numeric_limits<int>::max() = 2³¹ − 1 ≈ 2 GiB − 1`. Any `WritableSharedMemoryRegion::Create()` call with `size ≥ 2 GiB` returns an invalid region with no fallback.
-
-But §B per-context is **4 GiB** and §C per-origin is **8 GiB**, so legitimate requests can have `required_bytes ≥ 2 GiB`:
-
-| `required_bytes` | Single-region design |
-|---|---|
-| < 2 GiB | ✅ Fits in one region |
-| 2 – 4 GiB | ❌ A single `WritableSharedMemoryRegion::Create()` fails outright |
-| ≥ 4 GiB | ❌ Same (and exceeds §B) |
-
-Additional constraint: `SharedMemorySecurityPolicy::kTotalMappedSizeLimit = 32 GiB` (`base/memory/shared_memory_security_policy.cc:27`) is a process-wide mapping cap, so multiple concurrent large regions also push against this.
-
-**Fix: split the request into N chunks of size ≤ `kChunkSize`, with the kernel enforcing each chunk's size independently.**
-
-`kChunkSize` is chosen as 1 GiB:
-
-- Leaves a 1-GiB safety margin below `INT_MAX`.
-- Per-context 4 GiB → at most 4 chunks; the mojom array overhead is negligible.
-- 4 chunks × 1 GiB = 4 GiB ≪ 32-GiB process cap, leaving plenty of room for concurrent contexts.
-- Page-aligned (`base::SharedMemorySecurityPolicy::AlignWithPageSize` rounds up internally).
-
-### 5.3 Design: browser owns the fd; renderer writes through size-capped chunked SHM
-
-Core idea: **the renderer never holds a writable file handle**. The renderer sees a vector of `WritableSharedMemoryRegion`s, each with a kernel-pinned size; once writing is done, the browser flushes all chunks sequentially into a read-only temporary file and hands the RO handle to LiteRT/TFLite for `mmap`.
-
-#### 5.3.1 Mojo interface (replaces the current `CreateWeightsFile`)
+#### 5.3.1 Mojo interface
 
 ```mojom
+// Browser-process self-owned receiver, one creator per `navigator.ml`
+// (= one per renderer ExecutionContext). The creator is a thin factory:
+// it owns no per-file state, so concurrent `OpenWeightsFile` calls from
+// the same `navigator.ml` are independent.
 interface WebNNWeightsFileCreator {
-  // Browser:
-  //   1. Performs the §A/§B/§C quota checks (the original CreateWeightsFile
-  //      semantics).
-  //   2. Allocates ceil(required_bytes / kChunkSize) regions; the first N-1
-  //      are size = kChunkSize, the last is required_bytes - (N-1) * kChunkSize.
-  //   3. Creates a browser-owned tempfile (FLAG_DELETE_ON_CLOSE) — the renderer
-  //      never sees it.
-  // Returns null on rejection (over quota / not enough disk / SHM allocation
-  // failure).
-  AllocateWeightsBuffer(uint64 required_bytes)
-      => (array<mojo_base.mojom.WritableSharedMemoryRegion>? regions,
-          uint64 granted_bytes);
+  // Browser creates a deferred-unlink tempfile, dups a writable fd to the
+  // renderer, and self-owns a paired `WeightsFileSession` whose
+  // `PendingRemote` is returned. Fails (incognito, disk error) → returns
+  // null fd + null session; renderer falls back to in-memory Flatbuffer.
+  OpenWeightsFile()
+      => (mojo_base.mojom.File? writable_fd,
+          pending_remote<WeightsFileSession>? session);
+};
 
-  // Called by the renderer once all chunks are written. `bytes_per_chunk[i]` is
-  // the actual byte count written to chunk i; it must satisfy
-  // bytes_per_chunk[i] <= regions[i].GetSize(), otherwise ReportBadMessage.
-  // Browser:
-  //   1. Sequentially writes the first bytes_per_chunk[i] bytes of each region
-  //      into the tempfile (offset accumulates).
-  //   2. Closes all region handles.
-  //   3. Returns the RO file handle, which the renderer feeds to
-  //      LiteRT::ScopedFile.
-  FinalizeWeightsBuffer(array<uint64> bytes_per_chunk)
-      => (mojo_base.mojom.ReadOnlyFile? sealed_file);
+// Browser-side self-owned receiver, one per tempfile (= per `build()` call).
+// Combines incremental capacity accounting and finalization in a single
+// interface so all per-file state — tempfile, path, granted_bytes, origin —
+// is local to one object. Pipe disconnect (renderer crash / mid-build abort /
+// post-`Finalize` cleanup) triggers `~WeightsFileSessionImpl`, which returns
+// any accumulated granted_bytes_ to the process-wide `OriginUsageTracker`
+// and unlinks the tempfile (POSIX) / closes via `DeleteOnClose` (Windows).
+interface WeightsFileSession {
+  // Sync IPC before each write that would extend the file.
+  // Browser re-runs §D/§B/§C on every call (see §5.3.2).
+  [Sync]
+  RequestCapacityChange(uint64 new_size) => (bool granted);
 
-  ReleaseWeights(uint64 bytes);
+  // Called after all weights are written. Browser:
+  //   1. fstat the tempfile; size > granted_bytes_ → ReportBadMessage.
+  //   2. Reopen the tempfile read-only by path; unlink the path (POSIX) /
+  //      set DeleteOnClose (Windows). Returns the sealed RO fd for mmap.
+  // The session pipe is implicitly closed after this reply, which
+  // self-destructs the browser-side session and releases per-origin budget.
+  Finalize() => (mojo_base.mojom.ReadOnlyFile? sealed_file);
 };
 ```
 
-The mojo `AssociatedRemote` state across `AllocateWeightsBuffer` + `FinalizeWeightsBuffer` is owned by the browser-side `WeightsFileCreatorImpl`: between allocate and finalize, the browser keeps `tempfile_` and `regions_`; a mid-stream pipe disconnect is handled by the destructor backstop (see §3.5 pipe-disconnect backstop).
+> **Option A considered and rejected**: a single `WebNNWeightsFileCreator`
+> interface keyed by a per-file token in every method (`Write(token, …)`,
+> `Finalize(token)`) would also support concurrent files, but it spreads
+> per-file state across the creator and forces every call to validate the
+> token. Modeling each file as its own self-owned session matches existing
+> Mojo idioms (cf. `Tensor`, `Graph`) and keeps the renderer-side code
+> path identical to a single-build scenario.
 
-#### 5.3.2 Renderer-side change (`GraphBuilderTflite`)
+#### 5.3.2 Browser-side core logic (implementation summary)
 
-Today: `weights_file_.WriteAtCurrentPosAndCheck` + a `GetLength()` cursor + occasional `SetLength` to shrink ([`graph_builder_tflite.cc#L3258-L3312`](../chromium/src/services/webnn/tflite/graph_builder_tflite.cc#L3258-L3312)). After the change:
+`WeightsFileCreatorImpl` is a thin factory: it owns only `origin_` and
+`is_incognito_`. `WeightsFileSessionImpl` is self-owned via
+`MakeSelfOwnedReceiver` and owns `tempfile_`, `tempfile_path_`,
+`granted_bytes_`, and `origin_` — every piece of per-file state lives in
+one object. Multiple concurrent sessions per creator are fully independent.
+
+```
+OpenWeightsFile() on WeightsFileCreatorImpl:
+  if is_incognito_: return (null fd, null pipe)
+  (tempfile, path) = webnn::CreateWeightsFileWithPath()
+            // §A headroom check only (free >= headroom); unrelated to capacity grants
+  if !tempfile.IsValid(): return (null fd, null pipe)
+  renderer_fd = tempfile.Duplicate()
+  // Hand the writable fd to the session for the lifetime of this build.
+  WeightsFileSessionImpl::Create(session_remote, std::move(tempfile),
+                                 std::move(path), origin_)
+  return (renderer_fd, session_remote)
+
+RequestCapacityChange(new_size) on WeightsFileSessionImpl:
+  // §D anti-tamper — re-fstat on every IPC
+  current = tempfile_.GetLength()
+  if current < 0 || uint64_t(current) > granted_bytes_:
+    ReportBadMessage("renderer wrote past granted capacity"); return false
+  if new_size <= granted_bytes_: return true        // shrink / no-op
+  delta = new_size - granted_bytes_
+  // §B per-session cap (4 GiB) — see §5.3.3 for naming
+  if granted_bytes_ + delta > kMaxWeightsBytesPerContext: return false
+  // §C per-origin (8 GiB) — process-global OriginUsageTracker
+  if !OriginUsageTracker::TryReserve(origin_, delta): return false
+  granted_bytes_ += delta
+  return true
+
+Finalize() on WeightsFileSessionImpl:
+  current = tempfile_.GetLength()
+  if current < 0 || uint64_t(current) > granted_bytes_:
+    ReportBadMessage(...); return  // destructor cleans up tempfile + budget
+  // mojo_base.mojom.ReadOnlyFile traits CHECK O_RDONLY on POSIX; dup(O_RDWR)
+  // fails the check, so we reopen the path read-only and then unlink it.
+  ro_fd = base::File(tempfile_path_, FLAG_OPEN | FLAG_READ | FLAG_WIN_NO_EXECUTE)
+#if POSIX
+  unlink(tempfile_path_)            // open fds keep the inode alive
+#else  // Windows
+  tempfile_.DeleteOnClose(true)     // reclaimed when both handles close
+#endif
+  tempfile_.Close()
+  return ro_fd  // self-owned receiver tears down after this reply
+
+~WeightsFileSessionImpl:
+  if granted_bytes_ > 0:
+    OriginUsageTracker::Release(origin_, granted_bytes_)
+  if !tempfile_path_.empty():
+    // Backstop: pipe disconnected before Finalize ran.
+    base::ThreadPool::PostTask(BEST_EFFORT, base::DeleteFile(tempfile_path_))
+```
+
+Note: §A is not re-run inside `RequestCapacityChange`. The `OpenWeightsFile` call already ran a headroom check at creation time; subsequent extensions are bounded by §B/§C caps plus the global headroom. Adding a per-IPC `statvfs` would cost hundreds of µs × N constants per build for marginal benefit given §B/§C upper bounds.
+
+#### 5.3.3 Accounting ownership and concurrent-build support (§B semantics)
+
+In the in-renderer path, §B's "per-context 4 GiB" is enforced by `WeightsFileSessionImpl::granted_bytes_` **only** — `WebNNContextImpl::weights_bytes_` is never incremented (it is only touched by the GPU-process `WebNNContextImpl::CreateWeightsFile` path). As a result, `GraphImpl{Tflite,LiteRt}::DidCreateAndBuild` always passes `weights_bytes=0`, and there is no per-graph destructor release in the in-renderer path — the session pipe handles everything atomically.
+
+Practical consequence: §B granularity is *per-session* (= per-build), not *per-context*. A single `navigator.ml` running N concurrent graph builds gets N independent 4 GiB ceilings; the cross-build aggregate is bounded by §C's 8 GiB per-origin cap.
+
+**Concurrent-build correctness**: making the session interface self-owned per file (instead of multiplexing all files through a single `WeightsFileCreator` pipe) is what makes concurrent `build()` calls within one `navigator.ml` safe. Earlier iterations of this design used a single creator-bound `WeightsFileCapacityHost` and rejected overlapping `OpenWeightsFile` with `ReportBadMessage`, which would have killed the whole WebNN pipe for the frame on the second parallel `build()`. The current design makes each build's `OpenWeightsFile` spawn a fresh `WeightsFileSessionImpl`, so parallel builds never collide. Tightening §B to a true context-level aggregate would require cross-pipe accounting in `WebNNContextImpl`; this is intentionally not done — §C already caps the worst case at 8 GiB per origin, and per-build independence is the more useful invariant for graph compilation parallelism.
+
+`FLAG_DELETE_ON_CLOSE` note: on POSIX the tempfile is `unlink`'d immediately after `Finalize` (open fds keep the inode alive until the renderer drops its mmap); on Windows `DeleteOnClose(true)` reclaims on close. Net result is identical — no on-disk persistence after the last fd closes — but the mechanism differs.
+
+#### 5.3.4 Renderer-side (`GraphBuilderTflite::SerializeBuffer`)
 
 ```cpp
-class GraphBuilderTflite {
-  std::vector<base::WritableSharedMemoryMapping> chunks_;
-  uint64_t total_capacity_ = 0;       // = sum(chunks_[i].size())
-  uint64_t weights_bytes_written_ = 0;
+// graph_builder_tflite.cc:3287
+auto GraphBuilderTflite::SerializeBuffer(base::span<const uint8_t> buffer)
+    -> base::expected<BufferInfo, std::string> {
+  // ... seek + align + SetLength (trim padding)
 
-  bool AppendWeights(base::span<const uint8_t> buf) {
-    auto end = base::CheckedNumeric<uint64_t>(weights_bytes_written_) + buf.size();
-    uint64_t end_value;
-    if (!end.AssignIfValid(&end_value) || end_value > total_capacity_) {
-      return false;  // build fails — no ENOSPC
-    }
-    while (!buf.empty()) {
-      const size_t chunk_idx = weights_bytes_written_ / kChunkSize;
-      const size_t in_chunk_offset = weights_bytes_written_ % kChunkSize;
-      auto chunk_span = chunks_[chunk_idx].GetMemoryAsSpan<uint8_t>();
-      const size_t available = chunk_span.size() - in_chunk_offset;
-      const size_t to_copy = std::min<size_t>(buf.size(), available);
-      base::span_copy(chunk_span.subspan(in_chunk_offset, to_copy),
-                      buf.first(to_copy));
-      weights_bytes_written_ += to_copy;
-      buf = buf.subspan(to_copy);
-    }
-    return true;
+  if (session_.is_bound()) {
+    base::CheckedNumeric<uint64_t> new_size_checked = offset;
+    new_size_checked += buffer.size();
+    uint64_t new_size = 0;
+    if (!new_size_checked.AssignIfValid(&new_size))
+      return base::unexpected("Weights file size overflow.");
+    bool granted = false;
+    if (!session_->RequestCapacityChange(new_size, &granted) || !granted)
+      return base::unexpected("Weights file capacity request denied by browser.");
   }
-
-  uint64_t WeightsBytesWritten() const { return weights_bytes_written_; }
-};
+  if (!weights_file_.WriteAtCurrentPosAndCheck(buffer))
+    return base::unexpected("Failed to write weights file.");
+  ...
+}
 ```
 
-This is the same change identified in §3.2.2 ("why we don't preallocate") to remove the `GetLength()` dependency, so it isn't new scope. The `while` loop in `AppendWeights` handles cross-chunk-boundary writes; metadata offsets at higher layers continue to use `WeightsBytesWritten()`, semantically identical to the old `GetLength()`.
+**Streaming weights compatibility**: `RequestCapacityChange` only takes `new_size` — no global total needed. Each constant can be serialized and immediately dropped (`WebNNConstantOperand::Drop()`).
 
-#### 5.3.3 LiteRT/TFLite-side change
+#### 5.3.5 TFLite / LiteRT side
 
-None. `GraphImplLiteRt::ComputeResources::Create` still does:
+No changes. The `weights_file` source changes from "writable fd returned by one-shot `CreateWeightsFile`" to "RO fd returned by `WeightsFileSession::Finalize`"; TFLite/LiteRT `mmap`s it transparently. `GraphImpl{Tflite,LiteRt}::CreateAndBuild` binds the `WeightsFileSession` `SharedRemote` on the context sequence and keeps two copies — one moved into the background-thread builder closure for `RequestCapacityChange` calls, the other into the reply closure (`DidBuildGraph`) so it can call `session->Finalize` once the worker returns. The second SharedRemote is moved into the `Finalize` reply closure as a keep-alive; once the reply fires and the closure drops, the pipe closes and the browser-side session self-destructs (releasing per-origin budget).
 
-```cpp
-self->weights_file_ = std::make_unique<::litert::ScopedFile>(
-    build_graph_result.weights_file.TakePlatformFile());
-compilation_options.SetExternalWeightScopedFile(*self->weights_file_, ...);
-```
+### 5.4 Security analysis
 
-The `weights_file` source simply changes from "writable fd returned by `CreateWeightsFile`" to "RO fd returned by `FinalizeWeightsBuffer`". LiteRT `mmap`s it transparently; behavior is unchanged.
+| Attack | Old `CreateWeightsFile` | SHM chunked (abandoned) | Capacity tracker (this design) |
+|---|---|---|---|
+| Out-of-bounds fd write | ❌ bookkeeping only | ✅ kernel SIGBUS | ✅ per-IPC `fstat` + ReportBadMessage |
+| Requires total size upfront | Yes | Yes | No |
+| Streaming weights compatible | ❌ | ❌ | ✅ |
+| Renderer peak memory | All weights resident | All weights resident in SHM | Can drop each constant after write |
+| Extra memory copy | — | ❌ SHM→tempfile full copy | ✅ None |
+| Cross-platform | ✅ | ✅ | ✅ |
 
-### 5.4 Costs
+> **Why fd out-of-bounds write is no longer the threat it was**: the renderer holds a writable fd — same as FSA / OPFS — and the kernel will accept any `write()` syscall. The defense is not "renderer can't call `write()`"; it is "bytes written without a matching `RequestCapacityChange` can never reach the graph". See §5.4.1 for the full compromised-renderer threat model.
 
-- **One extra in-browser memory→disk copy**, bounded by `kMaxWeightsBytesPerContext = 4 GiB`. On NVMe a 1-GiB model adds roughly +300 ms – 1 s of graph-build latency. One-time cost; inference is unaffected.
-- **Peak memory at handoff:** all chunks (pagefile/swap, up to 4 GiB) and the tempfile (pagecache) coexist briefly; pagecache sharing helps but doesn't eliminate the spike.
-- **One extra Mojo round-trip:** `AllocateWeightsBuffer` + `FinalizeWeightsBuffer` instead of a single `CreateWeightsFile`. Serializing `array<region>` is at most 4 fds — negligible overhead.
-- **Renderer-side orchestration is slightly more complex:** a cross-chunk cursor plus a per-chunk `bytes_written` array, ~30 lines of additional logic.
+#### 5.4.1 Compromised renderer threat model
 
-### 5.5 Out of scope
+A compromised renderer holds a writable fd. The kernel has no knowledge of our IPC protocol — `write()` will succeed. This section enumerates *what the attacker can do / what happens / what the upper bound is*.
 
-- **A LiteRT in-memory API (`SetExternalWeightFromMemory(span<const uint8_t>)`).** Long-term goal — would let us skip the tempfile copy entirely (renderer finishes writing all chunks, the browser flips them to RO mappings, and the pointer goes straight into LiteRT). Requires upstream LiteRT cooperation; tracked as a separate feature request. Don't block this followup on it.
-- **Coupling the per-origin cap to disk size**, **collapsing the GPU path under §C.** Orthogonal to fd-level hard cap; tracked as §4 #1 / #2.
+| Attacker action | Succeeds? | Consequence / upper bound |
+|---|---|---|
+| `write(fd, ...)` directly, skip `RequestCapacityChange` | ✅ Bytes really land in the file | Bytes can't enter the graph: `FinalizeWeightsFile` / next `RequestCapacityChange` runs §D `fstat`; `current_length > granted_bytes_` → `ReportBadMessage` + renderer killed. If renderer never calls either again, build never completes (self-DoS). |
+| Repeatedly `write()` until ENOSPC | ✅ Single renderer can fill the disk during its lifetime | **Persistent damage = 0**: `FLAG_DELETE_ON_CLOSE` (POSIX unlinks at creation; Windows on close) reclaims the inode when the renderer exits. **Blast radius = contained**: once free disk < §A 10 GiB / 10% headroom, all subsequent `OpenWeightsFile` calls (any origin) return invalid → WebNN globally degrades to in-memory; GPU process does not crash. Same posture as OPFS / FSA — no web file API can prevent active writes by a compromised renderer. Hard upper bound = `min(physical free disk, sandbox RLIMIT_FSIZE)`. |
+| `dup(fd)` or `SCM_RIGHTS` clone fd across processes | ✅ Kernel allows it | All clones point to the same inode; §D `fstat` measures the inode's true size regardless of which fd wrote. Consequences same as row above. |
+| Clone the session pipe | ❌ | `pending_remote<WeightsFileSession>` is a one-shot Mojo endpoint issued by the browser; it cannot be cloned. Legitimate capacity growth still requires a sync IPC. |
+| Open many concurrent sessions to bypass per-session §B (4 GiB) | ⚠️ Partial — each session legitimately gets its own 4 GiB ceiling | Bounded by §C: the same `OriginUsageTracker` covers all sessions for the origin, so total outstanding across N sessions is still ≤ 8 GiB. "Many concurrent sessions" is the legitimate code path for parallel `build()` calls in the same `navigator.ml`. |
+| Never call `RequestCapacityChange` or `Finalize` | ✅ | Build never completes — pure self-DoS. Disk occupancy bounded by §A headroom + session-disconnect unlink. |
+| Write past `granted_bytes_`, then call `RequestCapacityChange(new_size <= granted_bytes_)` to smuggle it | ❌ | §D `fstat` is independent of `new_size` — it checks `current_length` vs `granted_bytes_` first; any overrun → `ReportBadMessage`. |
+| Smuggle tampered bytes into the final graph | ❌ | `Finalize` runs the same `fstat ≤ granted_bytes_` check; no RO fd is issued on failure → no `mmap` → no graph. |
 
-### 5.6 Tracking
+**Net attacker payoff**: a compromised renderer can only achieve "DoS the disk and WebNN during renderer lifetime" — no data-integrity violation, no arbitrary code execution, no cross-origin impact. Disk is reclaimed on renderer exit. This matches the defense depth of OPFS / FSA under the same threat model; WebNN cannot and does not need to offer stronger guarantees within the web platform framework.
 
-`crbug.com/XXXXXXX` (TBD). Recommend tagging `Security>WebNN` and `Component:WebNN`, Hotlist-Security-Severity-Low (the attack surface is bounded to a single origin's own disk slice; disk headroom backs it up; no cross-origin impact).
+### 5.5 Costs
 
+- **One sync IPC per weights extension**: ~N calls for N constants, ~50 µs each; negligible relative to graph-build time.
+- **One extra `fstat` per IPC**: ~µs.
+- **No extra memory copy**: saves up to 4 GiB of SHM→tempfile copying vs. the chunked-SHM design.
+
+### 5.6 Out of scope
+
+- **Plugging `storage::QuotaManager` in as the §C per-origin backend.** Long-term direction; `RequestCapacityChange` is designed as a frontend that can swap backends without touching renderer code.
+- **A LiteRT in-memory API (`SetExternalWeightFromMemory`).** Would eliminate the tempfile entirely; requires upstream LiteRT cooperation.
+- **Coupling the per-origin cap to disk size**, **collapsing the GPU path under §C.** Tracked as §4 #1 / #2.
+
+### 5.7 Tracking
+
+`crbug.com/XXXXXXX` (TBD). Recommend tagging `Security>WebNN` and `Component:WebNN`, Hotlist-Security-Severity-Low.
+
+The old chunked-SHM implementation (commit `2881a74236`) is replaced by this design.
 ---
 
 ## Appendix A: `storage::QuotaSettings` reference
@@ -551,7 +629,8 @@ WebNN's incognito handling: `WeightsFileCreatorImpl::CreateWeightsFile` returns 
 | `components/viz/host/gpu_host_impl.{h,cc}` | Plumb `required_bytes` through to `webnn::CreateWeightsFile` (GPU-process path covers §A) |
 | `services/webnn/public/mojom/webnn_context_provider.mojom` | `CreateWeightsFile()` gains `uint64 required_bytes`; new `ReleaseWeights(uint64 bytes)` |
 | `services/webnn/host/weights_file_provider.{h,cc}` | §A: disk-space check + adaptive headroom (10 GiB / 10%, no in-process serialization) |
-| `services/webnn/host/weights_file_creator_impl.{h,cc}` | §C: per-origin `OriginUsageTracker`; `ReleaseWeights` (over-release → `ReportBadMessage`; destructor returns leftover `reserved_bytes_`) |
+| `services/webnn/host/weights_file_creator_impl.{h,cc}` | §C: thin per-`navigator.ml` factory; `OpenWeightsFile` creates a tempfile and spawns a self-owned `WeightsFileSessionImpl` (no per-file state retained) |
+| `services/webnn/host/weights_file_session_impl.{h,cc}` | Per-file self-owned session: owns `tempfile_` / `tempfile_path_` / `granted_bytes_` / `origin_`; implements `RequestCapacityChange` (§B + §C + §D) and `Finalize` (anti-tamper fstat + RO reopen by path + unlink). Per-origin `OriginUsageTracker` lives in this TU as a process singleton, with the per-origin cap (`WeightsFileCreatorImpl::kMaxBytesPerOrigin`) and per-session cap (`kMaxWeightsBytesPerContext`) both enforced here |
 | `services/webnn/host/BUILD.gn` | Add `//url` dependency |
 | `services/webnn/webnn_context_impl.{h,cc}` | §B: per-context `weights_bytes_granted_`; `CreateWeightsFile` callback now `(File, uint64 granted_bytes)`; new public `ReleaseWeightsBytes(uint64)` |
 | `services/webnn/webnn_context_provider_impl.{h,cc}` | Plumb `required_bytes`; GPU-process path has no per-origin tracker — `CreateWeightsFile` carries a TODO (the path goes away once MLDrift delegate moves back to the renderer) |

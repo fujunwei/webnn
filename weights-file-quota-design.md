@@ -336,153 +336,236 @@ WebNN 没采用真预分配（`fallocate` / `SetEndOfFile`）的原因见 §3.2.
 
 ---
 
-## 5. Followup CL：跨平台 fd 级 hard cap
+## 5. Capacity tracker：renderer 直写 fd + 每次扩展前 sync IPC 记账
+
+> **方案演进说明（2026-06-17 更新）**
+>
+> 本节最初追求"kernel 强制的 fd 级 hard cap"，先后考虑过 chunked SharedMemory（commit `2881a74236`，已弃用）等方案，理由是把 §A/§B/§C "簿记型" 防护抬到 kernel 层。
+>
+> 这个出发点其实站不住：**FSA picker 不是一道安全边界**。File System Access 让 renderer 直接持有用户挑选文件的可写 fd，安全性来自两个**独立**层面：(1) 用户通过 picker 授权，决定 *哪些* 字节流可被这个 origin 访问，是 *用户隐私* 边界；(2) `FileSystemAccessCapacityTracker` 在 browser 进程对 quota / 磁盘空间做**增量记账**，决定 *能写多少*，是 *资源耗尽* 边界。这两层正交，缺一不可——picker 阻止恶意页面读你的私文件，但 picker 之后的写入量必须由 capacity tracker 守。
+>
+> 关键观察：**OPFS（Origin Private File System）走完全相同的 picker-less 路径**。OPFS sync access handle 不需要任何用户授权对话（origin 自动获得自己的私有文件系统），renderer 仍然直接拿到 writable fd，仍然走同一份 [`FileSystemAccessCapacityTracker`](https://source.chromium.org/chromium/chromium/src/+/main:third_party/blink/renderer/modules/file_system_access/file_system_access_capacity_tracker.cc) 做容量记账。OPFS 的安全性 100% 来自 browser-side capacity tracker——**没有 picker 也安全**。
+>
+> 把这个映射到 WebNN：weights tempfile 是 browser 自建的、生命周期严格绑定 context 的、不暴露给用户也不暴露给其他 origin 的私有文件，跟 OPFS 的 sandbox 文件本质同源。WebNN 也不需要 picker（用户从未"授权"weights 文件的存在），需要的只是**与 OPFS 等价的 capacity tracker**——renderer 持 writable fd，每次扩展前 sync IPC 调 `RequestCapacityChange(new_size)`，browser-side 在每次 IPC 上**重新执行** §A 磁盘 headroom + §B per-context cap + §C per-origin cap + §D `fstat` anti-tamper。安全保证不来自 fd 类型，而来自 IPC 边界上*增量、强制、不可绕开*的校验。
+>
+> 旧 chunked SHM 方案保留在 git 历史（commit `2881a74236`），由本设计取代。
 
 ### 5.1 问题
 
-§A/§B/§C 都是**簿记型**防护：browser 信任 in-renderer TFLite/LiteRT 不会写超过 `required_bytes`。被攻陷 renderer 可以 `CreateWeightsFile(required_bytes=1)` 通过所有上层检查，然后对返回的可写 fd `write()` 任意字节，最坏写满 §C cap 减 headroom 那么多。
+最初的 `CreateWeightsFile(required_bytes)` 是一次性簿记：browser 在创建 fd 之前根据 `required_bytes` 做一次 §A/§B/§C 检查，之后 fd 留在 renderer 手里没有任何 per-fd 上限。被攻陷 renderer 可以 `CreateWeightsFile(required_bytes=1)` 通过所有上层检查，再对可写 fd `write()` 任意字节，攻击者可在自己被允许的磁盘片内写到 §A headroom 边界（最坏情形 ENOSPC）。
 
-POSIX 没有 per-fd 写入字节配额（`RLIMIT_FSIZE` 是进程级）。Linux 可以 `memfd_create` + `F_SEAL_GROW` 在 fd 上做 hard cap，但 **Windows / macOS 没有等价机制**——任何可写 file handle 都能 `SetEndOfFile`/`ftruncate` 扩大文件。
+附加问题（同样由 reillyg@ 指出）：streaming weights 是 open issue——按 build 进度逐步释放 renderer 端 `WebNNConstantOperand` 内存——但要求 `CreateWeightsFile` 时给出精确 `required_bytes` 与 streaming 不兼容，因为 streaming 路径下 build 启动时根本不知道总大小。
 
-`base::WritableSharedMemoryRegion` 是天然的跨平台 hard cap：
+### 5.2 安全模型：picker 与 capacity tracker 的解耦
 
-| 平台 | 后端 | Cap 强制方 |
-|---|---|---|
-| Linux / Android / ChromeOS | `memfd_create` + `F_SEAL_SHRINK \| F_SEAL_GROW` | Kernel 拒绝 grow，越界写 `SIGBUS` |
-| Windows | 命名 section（pagefile-backed），`CreateFileMapping(SECTION_QUERY \| FILE_MAP_WRITE)` | Section 大小创建时固定，越界访问 access violation |
-| macOS | Mach VM region / POSIX shm | 大小创建时固定，越界访问 `EXC_BAD_ACCESS` |
+把 FSA / OPFS / WebNN 摊开对比：
 
-跨平台**无任何代码分支**：`base::WritableSharedMemoryRegion::Create(N)` 在每个平台内部都做对应的 syscall；renderer 端 `WritableSharedMemoryMapping::GetMemoryAsSpan<uint8_t>()` 给出的 span 大小就是 `N`，越界由 kernel 强制。
+| 维度 | FSA picker 文件 | OPFS sandbox 文件 | WebNN weights tempfile |
+|---|---|---|---|
+| 用户授权层 | picker 选具体文件（隐私） | 无 picker（origin 自动） | 无 picker（service 自建） |
+| 谁拿到 writable fd | renderer | renderer | renderer（in-renderer TFLite/LiteRT） |
+| 每次扩展前 sync IPC 校验 | ✅ `FileSystemAccessCapacityTracker.RequestFileCapacityChangeSync` | ✅ 同一 tracker 类 | ✅ `WeightsFileCapacityHost.RequestCapacityChange` |
+| 资源耗尽防御层 | browser 进程 capacity tracker | browser 进程 capacity tracker | browser 进程 §A/§B/§C/§D（本设计） |
+| 文件生命周期 | 用户文件，绕过 origin 卸载 | origin 私有，origin 删除即清 | context 绑定，pipe 关闭即 unlink |
+| 跨 origin 读取暴露 | picker 阻止 | OPFS 隔离阻止 | 文件 fd 不离开 service↔renderer 通道 |
 
-### 5.2 SharedMemory 的 2 GiB 限制：必须分块
+WebNN 与 OPFS 的相似度比与 FSA picker 路径更高：都是 picker-less、origin-内部、由 user agent 自建的文件，安全性完全来自 browser-side 增量记账。
 
-`base::PlatformSharedMemoryRegion::Create()` 在所有平台都硬编码 `INT_MAX` 上限：
+> **GPU-process 路径不在本节范围**：GPU process 内的 LiteRT GPU delegate 通过 `viz::mojom::GpuHost::CreateWebNNWeightsFile` 创建 fd，fd 不离开 GPU 进程，renderer 拿不到，没有 fd 越界写问题；它的限制由 §A 进程级 headroom + §B per-context 自检负责。本节的 capacity tracker 只覆盖 in-renderer TFLite/LiteRT 路径。
 
-| 平台 | 文件 | 检查 |
-|---|---|---|
-| POSIX (Linux/CrOS) | `base/memory/platform_shared_memory_region_posix.cc:183` | `if (size > std::numeric_limits<int>::max()) return {};` |
-| Android | `..._android.cc:53,138` | 同上，rounded_size 也再查一次 |
-| macOS | `..._apple.cc:30` | 同上 |
-| Windows | `..._win.cc` | 同上 |
+### 5.3 设计
 
-`std::numeric_limits<int>::max() = 2³¹ − 1 ≈ 2 GiB − 1 byte`。任何 `size ≥ 2 GiB` 的 `WritableSharedMemoryRegion::Create()` 返回 invalid region，无 fallback。
-
-但 §B per-context 上限是 **4 GiB**、§C per-origin 是 **8 GiB**，覆盖到了 `required_bytes ≥ 2 GiB` 的合法场景：
-
-| `required_bytes` | 单 region 设计 |
-|---|---|
-| < 2 GiB | ✅ 一个 region 装得下 |
-| 2 – 4 GiB | ❌ 单个 `WritableSharedMemoryRegion::Create()` 直接失败 |
-| ≥ 4 GiB | ❌ 同上（且超 §B） |
-
-额外约束：`SharedMemorySecurityPolicy::kTotalMappedSizeLimit = 32 GiB`（`base/memory/shared_memory_security_policy.cc:27`）是 process-wide 映射上限，多个并发大 region 也会撞这个。
-
-**解决：把请求拆成 N 个 ≤ `kChunkSize` 的 chunk，每个 chunk 由 kernel 独立强制大小。**
-
-`kChunkSize` 选择 1 GiB：
-
-- 在 INT_MAX 下方留 1 GiB 安全边距
-- per-context 4 GiB → 最多 4 chunks，mojom array 开销可忽略
-- 4 chunks × 1 GiB = 4 GiB ≪ 32 GiB 进程级上限，并发空间充裕
-- page-aligned (`base::SharedMemorySecurityPolicy::AlignWithPageSize` 内部还会 round up)
-
-### 5.3 设计：browser 持有 fd，renderer 通过分块的 size-capped SHM 写入
-
-核心思路：**renderer 永远不持有可写文件句柄**。renderer 看到的是一组每块大小被 kernel 钉死的 `WritableSharedMemoryRegion`；写完后由 browser 把所有 chunk 顺序刷到只读临时文件，发回 RO 句柄给 LiteRT/TFLite mmap。
-
-#### 5.3.1 Mojo 接口（替换当前 `CreateWeightsFile`）
+#### 5.3.1 Mojo 接口
 
 ```mojom
+// Browser 端 self-owned receiver，per-`navigator.ml` 一个 creator
+// （= per renderer ExecutionContext 一个）。Creator 是纯工厂：自身不持有任何
+// per-file 状态，所以同一个 `navigator.ml` 内并发 `OpenWeightsFile` 互相独立。
 interface WebNNWeightsFileCreator {
-  // Browser:
-  //   1. 配额检查（§A/§B/§C），原 CreateWeightsFile 的语义
-  //   2. 分配 ceil(required_bytes / kChunkSize) 个 region；前 N-1 个 size = kChunkSize，
-  //      最后一个 size = required_bytes - (N-1) * kChunkSize
-  //   3. 在 browser 进程创建 tempfile（FLAG_DELETE_ON_CLOSE），不发给 renderer
-  //   返回 null 表示拒绝（over quota / not enough disk / SHM 分配失败）。
-  AllocateWeightsBuffer(uint64 required_bytes)
-      => (array<mojo_base.mojom.WritableSharedMemoryRegion>? regions,
-          uint64 granted_bytes);
+  // Browser 创建一个延迟 unlink 的 tempfile，dup 一个 writable fd 给 renderer，
+  // 同时为这个 tempfile self-own 一个 `WeightsFileSession`，把 PendingRemote
+  // 一并返回。失败（incognito、磁盘错误）返回 null fd + null session，
+  // renderer 退回 in-memory Flatbuffer。
+  OpenWeightsFile()
+      => (mojo_base.mojom.File? writable_fd,
+          pending_remote<WeightsFileSession>? session);
+};
 
-  // Renderer 写完所有 chunks 后调用。`bytes_per_chunk[i]` 是第 i 个 chunk 的实际写入字节数，
-  // 必须满足 bytes_per_chunk[i] <= regions[i].GetSize()，否则 ReportBadMessage。
-  // Browser:
-  //   1. 顺序把每个 region 的前 bytes_per_chunk[i] 字节写入 tempfile（offset 累加）
-  //   2. 关掉所有 region 句柄
-  //   3. 返回 RO file handle，renderer 喂给 LiteRT::ScopedFile
-  FinalizeWeightsBuffer(array<uint64> bytes_per_chunk)
-      => (mojo_base.mojom.ReadOnlyFile? sealed_file);
+// Browser 端 self-owned receiver，per-tempfile 一个（= per `build()` 一个）。
+// 把增量配额记账与 finalize 合在同一个接口里，所有 per-file 状态
+// （tempfile、path、granted_bytes、origin）集中在一个对象。Pipe 断开
+// （renderer crash / 中途放弃 / `Finalize` 完成后的析构）会触发
+// `~WeightsFileSessionImpl`，把累计 granted_bytes_ 一次性归还进程级
+// `OriginUsageTracker`，并 unlink tempfile（POSIX）/ `DeleteOnClose`（Windows）。
+interface WeightsFileSession {
+  // 每次扩展文件前 sync IPC。new_size = 计划写入后的文件大小。
+  // Browser 在每次调用上**全部**重新执行 §A/§B/§C/§D 检查（见 5.3.2）。
+  [Sync]
+  RequestCapacityChange(uint64 new_size) => (bool granted);
 
-  ReleaseWeights(uint64 bytes);
+  // Renderer 写完后调用。Browser:
+  //   1. fstat tempfile，校验 size <= granted_bytes_（否则 ReportBadMessage）
+  //   2. 按 path 重开为 RO；POSIX unlink path / Windows DeleteOnClose(true)。
+  //      返回 sealed RO fd 给 renderer mmap。
+  // Session pipe 在 reply 后随之关闭，触发浏览器端 session 自销毁
+  // （归还 §C per-origin 配额）。
+  Finalize() => (mojo_base.mojom.ReadOnlyFile? sealed_file);
 };
 ```
 
-`AllocateWeightsBuffer` + `FinalizeWeightsBuffer` 的 mojo `AssociatedRemote` 状态由 browser-side `WeightsFileCreatorImpl` 持有：从 allocate 到 finalize 之间，browser 端保留 `tempfile_` 与 `regions_`，pipe 中途 disconnect 由析构兜底（参见 §3.5 Pipe-disconnect 兜底）。
+> **Option A 已考虑、被否决**：另一种做法是把所有方法塞进同一个
+> `WebNNWeightsFileCreator` 接口，每次调用都带一个 per-file token
+> （`Write(token, …)`, `Finalize(token)`）。该方案在功能上同样支持并发文件，
+> 但 per-file 状态会摊在 creator 实现里，每次调用都要校验 token。把每个文件
+> 建模成自己的 self-owned session 与现有 Mojo 习惯一致（参见 `Tensor`、
+> `Graph`），并且让 renderer 端代码路径与单 build 场景完全一样。
 
-#### 5.3.2 Renderer 侧改造（`GraphBuilderTflite`）
+#### 5.3.2 Browser 侧核心逻辑（实现摘要）
 
-当前用 `weights_file_.WriteAtCurrentPosAndCheck` + `GetLength()` cursor + 偶尔 `SetLength` 缩容（[`graph_builder_tflite.cc#L3258-L3312`](../chromium/src/services/webnn/tflite/graph_builder_tflite.cc#L3258-L3312)）。改造后：
+`WeightsFileCreatorImpl` 是一个纯工厂：只持有 `origin_` 与 `is_incognito_`。
+`WeightsFileSessionImpl` 通过 `MakeSelfOwnedReceiver` 自持有，独占
+`tempfile_`、`tempfile_path_`、`granted_bytes_`、`origin_` ——所有 per-file
+状态集中在一个对象内。同一个 creator 下并发存在多个 session 互不影响。
+
+```
+OpenWeightsFile() on WeightsFileCreatorImpl:
+  if is_incognito_: return (null fd, null pipe)
+  (tempfile, path) = webnn::CreateWeightsFileWithPath()
+            // 内部跑 §A 磁盘 headroom 大致体检
+            // (free >= headroom)，与"授予容量"无关
+  if !tempfile.IsValid(): return (null fd, null pipe)
+  renderer_fd = tempfile.Duplicate()
+  // 把 writable fd 移交给 session，跟随本次 build 生命周期。
+  WeightsFileSessionImpl::Create(session_remote, std::move(tempfile),
+                                 std::move(path), origin_)
+  return (renderer_fd, session_remote)
+
+RequestCapacityChange(new_size) on WeightsFileSessionImpl:
+  // §D anti-tamper —— 每次 IPC 前重新 fstat
+  current = tempfile_.GetLength()
+  if current < 0 || uint64_t(current) > granted_bytes_:
+    ReportBadMessage("renderer wrote past granted capacity"); return false
+  if new_size <= granted_bytes_: return true              // shrink / no-op
+  delta = new_size - granted_bytes_
+  // §B per-session（4 GiB）—— 命名见 5.3.3
+  if granted_bytes_ + delta > kMaxWeightsBytesPerContext: return false
+  // §C per-origin（8 GiB）—— 进程级 OriginUsageTracker
+  if !OriginUsageTracker::TryReserve(origin_, delta): return false
+  granted_bytes_ += delta
+  return true
+
+Finalize() on WeightsFileSessionImpl:
+  current = tempfile_.GetLength()
+  if current < 0 || uint64_t(current) > granted_bytes_:
+    ReportBadMessage(...); return  // 析构清理 tempfile + 归还配额
+  // mojo_base.mojom.ReadOnlyFile traits 在 POSIX 上 CHECK O_RDONLY；
+  // dup(O_RDWR) 通不过，所以按 path 重开为 read-only 再 unlink。
+  ro_fd = base::File(tempfile_path_, FLAG_OPEN | FLAG_READ | FLAG_WIN_NO_EXECUTE)
+#if POSIX
+  unlink(tempfile_path_)            // 已打开的 fds 维持 inode 存活
+#else  // Windows
+  tempfile_.DeleteOnClose(true)     // 两个句柄都关时回收
+#endif
+  tempfile_.Close()
+  return ro_fd  // reply 后 self-owned receiver 析构
+
+~WeightsFileSessionImpl:
+  if granted_bytes_ > 0:
+    OriginUsageTracker::Release(origin_, granted_bytes_)
+  if !tempfile_path_.empty():
+    // 兜底：pipe 在 Finalize 之前断开。
+    base::ThreadPool::PostTask(BEST_EFFORT, base::DeleteFile(tempfile_path_))
+```
+
+注意：§A 不在 `RequestCapacityChange` 路径上重复执行，因为 §A 检查的是"剩余磁盘空间是否够本次新分配 + 系统级 headroom"。`OpenWeightsFile` 创建文件那一刻已经做过一次（仅校验 headroom），后续扩展由 §B/§C 上限封顶 + 全局 headroom 吸收。如果担心慢速磁盘填充，可以把 §A 也搬进 `RequestCapacityChange`，但每次 sync IPC 多 1 次 `statvfs`（数百 µs，对 N 个常量的 build 是 N×几百 µs），目前不做。
+
+#### 5.3.3 簿记的归属与并发 build 支持（§B 语义）
+
+In-renderer 路径下 §B 的"per-context 4 GiB"由 `WeightsFileSessionImpl::granted_bytes_` 承担，**不**走 `WebNNContextImpl::weights_bytes_`——后者只在 GPU-process 路径的 `WebNNContextImpl::CreateWeightsFile` 里被加减，in-renderer 路径全程为 0；`GraphImpl{Tflite,LiteRt}::DidCreateAndBuild` 因此固定传 `weights_bytes=0`，不走析构释放。
+
+实际粒度：§B 的真实粒度是 *per-session*（= per-build）而非 *per-context*。同一个 `navigator.ml` 同时跑 N 个并发 graph build 时各拿一个独立 4 GiB 上限，互不约束；跨 build 累计仍由 §C 的 8 GiB per-origin 兜底。
+
+**并发 build 正确性**：把 session 接口做成 per-file self-owned（而不是把所有文件复用到同一个 `WeightsFileCreator` pipe）是并发 `build()` 安全的根本原因。早期一版设计是单个 creator-bound `WeightsFileCapacityHost`，重叠 `OpenWeightsFile` 直接 `ReportBadMessage`，这会让 frame 上第二个并发 `build()` 触发整个 WebNN pipe 被杀。当前设计每次 `OpenWeightsFile` 都 spawn 一个全新的 `WeightsFileSessionImpl`，并发 build 永远不撞车。如果未来希望把 §B 收紧到真正的 context 级聚合，需在 `WebNNContextImpl` 里做 cross-pipe 累计；目前不做——§C 已经把最坏情形封到 8 GiB/origin，而 per-build 独立性对 graph 编译并行才是更有用的不变式。
+
+`FLAG_DELETE_ON_CLOSE` 的语义同此处一并澄清：POSIX 上 tempfile 在 `Finalize` 后立即 `unlink`，但 open fds 维持 inode 存活直到 renderer 把 mmap 释放；Windows 上靠 `DeleteOnClose(true)`，关闭即销毁——结果一致（fd 关掉就没了），但路径不同。
+
+#### 5.3.4 Renderer 侧（`GraphBuilderTflite::SerializeBuffer`）
 
 ```cpp
-class GraphBuilderTflite {
-  std::vector<base::WritableSharedMemoryMapping> chunks_;
-  uint64_t total_capacity_ = 0;       // = sum(chunks_[i].size())
-  uint64_t weights_bytes_written_ = 0;
+// graph_builder_tflite.cc:3287
+auto GraphBuilderTflite::SerializeBuffer(base::span<const uint8_t> buffer)
+    -> base::expected<BufferInfo, std::string> {
+  // ... seek + align + SetLength（trim padding）
 
-  bool AppendWeights(base::span<const uint8_t> buf) {
-    auto end = base::CheckedNumeric<uint64_t>(weights_bytes_written_) + buf.size();
-    uint64_t end_value;
-    if (!end.AssignIfValid(&end_value) || end_value > total_capacity_) {
-      return false;  // build 失败，无 ENOSPC
-    }
-    while (!buf.empty()) {
-      const size_t chunk_idx = weights_bytes_written_ / kChunkSize;
-      const size_t in_chunk_offset = weights_bytes_written_ % kChunkSize;
-      auto chunk_span = chunks_[chunk_idx].GetMemoryAsSpan<uint8_t>();
-      const size_t available = chunk_span.size() - in_chunk_offset;
-      const size_t to_copy = std::min<size_t>(buf.size(), available);
-      base::span_copy(chunk_span.subspan(in_chunk_offset, to_copy),
-                      buf.first(to_copy));
-      weights_bytes_written_ += to_copy;
-      buf = buf.subspan(to_copy);
-    }
-    return true;
+  if (session_.is_bound()) {
+    base::CheckedNumeric<uint64_t> new_size_checked = offset;
+    new_size_checked += buffer.size();
+    uint64_t new_size = 0;
+    if (!new_size_checked.AssignIfValid(&new_size))
+      return base::unexpected("Weights file size overflow.");
+    bool granted = false;
+    if (!session_->RequestCapacityChange(new_size, &granted) || !granted)
+      return base::unexpected("Weights file capacity request denied by browser.");
   }
-
-  uint64_t WeightsBytesWritten() const { return weights_bytes_written_; }
-};
+  if (!weights_file_.WriteAtCurrentPosAndCheck(buffer))
+    return base::unexpected("Failed to write weights file.");
+  ...
+}
 ```
 
-这是 §3.2.2 "为什么不做真预分配"里识别出来的同一处改动（消除对 `GetLength()` 的依赖），所以不算新增 scope。`AppendWeights` 内部 while 循环处理跨 chunk 边界的写入；上层 metadata offset 仍然用 `WeightsBytesWritten()`，跟原 `GetLength()` 语义一致。
+**Streaming weights 兼容性**：`RequestCapacityChange` 只看 `new_size`，不依赖任何全局总大小，每个常量序列化后可立刻 `WebNNConstantOperand::Drop()`。
 
-#### 5.3.3 LiteRT/TFLite 侧改造
+#### 5.3.5 TFLite/LiteRT 侧
 
-零改动。`GraphImplLiteRt::ComputeResources::Create` 仍然走：
+零改动。`weights_file` 来源从一次性 `CreateWeightsFile` 的可写 fd 变成 `WeightsFileSession::Finalize` 返回的 RO fd；TFLite/LiteRT 透明 mmap，运行时行为不变。`GraphImpl{Tflite,LiteRt}::CreateAndBuild` 在 context sequence 上把 `WeightsFileSession` `SharedRemote` 绑定，保留两份 ——一份移交给后台线程的 builder 闭包用于 `RequestCapacityChange`，另一份移交 reply 闭包（`DidBuildGraph`），等 worker 返回后调 `session->Finalize`。第二份 SharedRemote 作为 keep-alive 移入 `Finalize` 的 reply 闭包；reply 触发、闭包销毁后 pipe 自然关闭，浏览器端 session 自销毁（归还 per-origin 配额）。
 
-```cpp
-self->weights_file_ = std::make_unique<::litert::ScopedFile>(
-    build_graph_result.weights_file.TakePlatformFile());
-compilation_options.SetExternalWeightScopedFile(*self->weights_file_, ...);
-```
+### 5.4 安全分析
 
-只是 `weights_file` 来源从"`CreateWeightsFile` 返回的可写 fd"变成"`FinalizeWeightsBuffer` 返回的 RO fd"。LiteRT 透明 mmap，行为不变。
+| 攻击 | 旧 `CreateWeightsFile` | SHM chunked（已弃用） | Capacity tracker（本设计） |
+|---|---|---|---|
+| 越界写 fd | ❌ 仅簿记 | ✅ kernel SIGBUS | ✅ 每次 IPC `fstat` + ReportBadMessage |
+| 需提前知道总大小 | 是 | 是 | 否 |
+| Streaming weights 兼容 | ❌ | ❌ | ✅ |
+| Renderer 内存峰值 | 全部 weights 驻留 | 全部 weights 驻留 SHM | 可边写边释放 |
+| 零额外内存拷贝 | — | ❌ SHM→tempfile 全量拷贝 | ✅ |
+| 跨平台 | ✅ | ✅ | ✅ |
 
-### 5.4 代价
+> **关于 fd 越界写为何不再是问题**：renderer 拿 writable fd 与 FSA / OPFS 一致；安全保证不来自 fd 类型，而来自每次扩展前的强制 sync IPC。最坏情况 renderer 在两次 `RequestCapacityChange` 之间偷写：下一次 `RequestCapacityChange` 的 §D `fstat` 检查会发现 `current_length > granted_bytes_`，立刻 `ReportBadMessage` 杀掉该 renderer；偷写的字节因 `FLAG_DELETE_ON_CLOSE` 在 fd 关闭时随 tempfile 一起 unlink。攻击者无法把"偷写的字节"提交进图（`FinalizeWeightsFile` 也跑同样的 `fstat` 校验），即使能写，写完了也马上被销毁。
 
-- **额外一次 in-browser 内存→磁盘拷贝**，量级 ≤ `kMaxWeightsBytesPerContext = 4 GiB`。NVMe 上 1 GiB 模型大约 +300 ms–1 s graph build 延迟。一次性成本，不影响推理。
-- **Handoff 瞬间峰值内存**：所有 chunks（pagefile/swap，最多 4 GiB）+ tempfile（pagecache）同时存在；pagecache 共享缓解但不消除。
-- **多一次 Mojo round-trip**：从一次 `CreateWeightsFile` 拆成 `AllocateWeightsBuffer` + `FinalizeWeightsBuffer`，array<region> 序列化 ≤ 4 个 fd，开销可忽略。
-- **Renderer 端编排略复杂**：跨 chunk 的 cursor + per-chunk bytes_written 数组，约 30 行额外逻辑。
+#### 5.4.1 Compromised renderer 行为模型
 
-### 5.5 不在范围
+Security review 反复出现的问题：被攻陷的 renderer 拿到 writable fd 之后能干什么？kernel 不知道我们的 IPC 协议——可写 fd + `write()` syscall 永远成功。所以这一节明确列出 *能干什么 / 干完会怎样 / 上界是什么*。
 
-- **LiteRT 加内存 API（`SetExternalWeightFromMemory(span<const uint8_t>)`）**：长期目标，可消除整个 tempfile 拷贝步骤——renderer 写完所有 chunks 转 RO mapping，指针直接喂给 LiteRT。需要 LiteRT 上游协作，单独 file feature request。先不阻塞这个 followup。
-- **Per-origin cap 跟磁盘联动**、**GPU 路径合入 §C**：与 fd 级 hard cap 正交，保持现有 §4 #1/#2 的 followup 计划。
+| 攻击者动作 | 是否成功 | 后果 / 上界 |
+|---|---|---|
+| 直接 `write(fd, ...)` 跳过 `RequestCapacityChange` | ✅ 写入会真的进文件 | 偷写字节进不了 graph：`FinalizeWeightsFile` / 下一次 `RequestCapacityChange` 跑 §D `fstat`，`current_length > granted_bytes_` 即 `ReportBadMessage` 杀渲染器；renderer 不再调这两个则 build 永不完成（自 DoS） |
+| 不停 `write()` 直到 ENOSPC | ✅ 单 renderer 寿命内可填满磁盘 | **持久伤害 = 0**：`FLAG_DELETE_ON_CLOSE`（POSIX 创建时即 `unlink`，Windows 关 fd 触发）保证 renderer 一退磁盘归还。**爆炸半径 = 受控**：free disk 跌破 §A 10 GiB / 10% headroom 后，所有 origin 的下次 `OpenWeightsFile` 自动返回 invalid → WebNN 全局降级到 in-memory，GPU 进程不崩。同 OPFS / FSA 现状，无 web 文件 API 能在"渲染端已被攻陷"前提下阻止主动写。硬上限 = `min(物理 free disk, sandbox RLIMIT_FSIZE)` |
+| `dup(fd)` 或 `SCM_RIGHTS` 跨进程克隆 fd | ✅ 内核允许 | 所有克隆指向同一 inode，§D `fstat` 看的是 inode 实际大小，与写入路径无关；偷写后果同上一行 |
+| 克隆 session pipe | ❌ | `pending_remote<WeightsFileSession>` 是 browser 一次性下发的 Mojo 端点，不可克隆。合法扩容仍需走 sync IPC |
+| 同时开很多 session 试图绕过 per-session §B（4 GiB）| ⚠️ 部分成立 ——每个 session 合法地各拿 4 GiB 上限 | 由 §C 兜底：同一 origin 所有 session 共享同一份 `OriginUsageTracker`，跨 session 累计 outstanding 仍 ≤ 8 GiB。"并发多 session"本身就是同一个 `navigator.ml` 并发 `build()` 的合法路径 |
+| 永远不调 `RequestCapacityChange` 也不 `Finalize` | ✅ | Graph 永不完成，纯自 DoS；磁盘占用受 §A headroom + session pipe 断开兜底约束 |
+| 偷写后调 `RequestCapacityChange(new_size <= granted_bytes_)` 试图蒙混 | ❌ | §D `fstat` 不依赖 `new_size`，先看 `current_length` vs `granted_bytes_`；越界即杀 |
+| 把偷写字节注入最终 graph | ❌ | `Finalize` 同样跑 `fstat ≤ granted_bytes_` 才发 RO fd；不通过则不 mmap、不 build |
 
-### 5.6 跟踪
+**净收益分析**：被攻陷 renderer 只能拿到"在自己进程寿命内 DoS 一块磁盘 + DoS WebNN 整体"，无任何数据完整性 / 任意代码 / 跨 origin 收益；renderer 一退即清。这与 OPFS / FSA 在同等威胁模型下的防御深度持平——WebNN 不需要、也无法在 web platform 框架内做更强保证。
 
-`crbug.com/XXXXXXX`（待开）。建议挂 `Security>WebNN` 和 `Component:WebNN`，Hotlist-Security-Severity-Low（攻击边界仅限单 origin 自己的磁盘片，磁盘 headroom 兜底，无 cross-origin 影响）。
+### 5.5 代价
 
+- **每次 weights 扩展一次 sync IPC**：约 N 个常量 N 次 IPC，单次 ~50 µs；graph build 总延迟可忽略
+- **每次 IPC 多一个 fstat**：µs 级
+- **零额外内存拷贝**：相比 SHM 方案省去最多 4 GiB 的 SHM→tempfile 搬运
+
+### 5.6 不在范围
+
+- **接入 `storage::QuotaManager` 替换自建 §C per-origin budget**：长期方向。Capacity tracker 的 `RequestCapacityChange` 接口设计为 frontend，未来可平滑替换 QuotaManager backend 而不改 renderer 端代码。
+- **LiteRT 加内存 API（`SetExternalWeightFromMemory`）**：可消除 tempfile 整体，未来上游协作。
+- **Per-origin cap 跟磁盘联动**、**GPU 路径合入 §C**：保持 §4 #1/#2 followup 计划。
+
+### 5.7 跟踪
+
+`crbug.com/XXXXXXX`（待开）。建议挂 `Security>WebNN` 和 `Component:WebNN`，Hotlist-Security-Severity-Low。
+
+旧 SHM chunked 实现（commit `2881a74236`）将在新 CL 中被替换；新 CL 标题：`webnn: Stream weights via incremental capacity tracker`。
 ---
 
 ## 附录 A：`storage::QuotaSettings` 参考
@@ -543,7 +626,8 @@ WebNN 的 incognito 处理：在 `WeightsFileCreatorImpl::CreateWeightsFile` 直
 | `components/viz/host/gpu_host_impl.{h,cc}` | 透传 `required_bytes` 给 `webnn::CreateWeightsFile`（GPU-process 路径覆盖 §A） |
 | `services/webnn/public/mojom/webnn_context_provider.mojom` | `CreateWeightsFile()` 加 `uint64 required_bytes`；新增 `ReleaseWeights(uint64 bytes)` |
 | `services/webnn/host/weights_file_provider.{h,cc}` | §A: 磁盘空间检查 + 自适应 headroom (10 GiB / 10%, 无进程内串行) |
-| `services/webnn/host/weights_file_creator_impl.{h,cc}` | §C: per-origin `OriginUsageTracker`；`ReleaseWeights` 实现（over-release `ReportBadMessage`，析构兜底 `reserved_bytes_` 残余） |
+| `services/webnn/host/weights_file_creator_impl.{h,cc}` | §C: per-`navigator.ml` 纯工厂；`OpenWeightsFile` 创建 tempfile + 拉起 self-owned `WeightsFileSessionImpl`（自身不保留 per-file 状态） |
+| `services/webnn/host/weights_file_session_impl.{h,cc}` | Per-file self-owned session：独占 `tempfile_` / `tempfile_path_` / `granted_bytes_` / `origin_`；实现 `RequestCapacityChange`（§B + §C + §D）与 `Finalize`（anti-tamper fstat + 按 path RO 重开 + unlink）。Per-origin `OriginUsageTracker` 作为进程单例落在此 TU 内，per-origin 上限（`WeightsFileCreatorImpl::kMaxBytesPerOrigin`）与 per-session 上限（`kMaxWeightsBytesPerContext`）都在这里执行 |
 | `services/webnn/host/BUILD.gn` | 加 `//url` 依赖 |
 | `services/webnn/webnn_context_impl.{h,cc}` | §B: per-context `weights_bytes_granted_`；`CreateWeightsFile` 回调改为 `(File, uint64 granted_bytes)`；新增 public `ReleaseWeightsBytes(uint64)` |
 | `services/webnn/webnn_context_provider_impl.{h,cc}` | 透传 `required_bytes`；GPU-process 路径无 per-origin tracker，`CreateWeightsFile` 上加 TODO（等 MLDrift delegate 迁回 renderer 后此路径整体消失） |

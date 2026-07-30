@@ -1,0 +1,49 @@
+diff --git a/.bazelrc.user b/.bazelrc.user
+new file mode 100644
+index 000000000..60b8534c3
+--- /dev/null
++++ b/.bazelrc.user
+@@ -0,0 +1,43 @@
++# crcxx: build ml_drift/litert with Chromium's clang 23 + Chromium's libc++ so the
++# produced .so is ABI-compatible with the host Chromium (webnn §6b quick-verify).
++#
++# MUST be used together with --config=clang_local, which disables cc_toolchain
++# resolution so Bazel falls back to @local_config_cc (honors CC / USE_HERMETIC=0).
++# The hermetic rules_ml_toolchain otherwise forces GCC-8 libstdc++ + an old clang
++# that cannot parse Chromium's libc++ headers, and yields a libstdc++ std::unordered_map
++# whose layout mismatches chrome's libc++ map -> GetOption() crash (analysis §4).
++#
++# BAZEL_CXXOPTS is read by @local_config_cc BOTH to detect builtin include dirs
++# (so the libc++ paths are exempt from Bazel's exec-root / undeclared-inclusion
++# checks) AND as cxx flags on every compile (so libc++ headers are actually found).
++# The single force-included __config_site locks _LIBCPP_ABI_VERSION 2 + __Cr.
++
++build:crcxx --repo_env=CC=/home/junwei/workspace/chromium/src/third_party/llvm-build/Release+Asserts/bin/clang
++build:crcxx --repo_env=USE_HERMETIC_CC_TOOLCHAIN=0
++build:crcxx --repo_env=BAZEL_CXXOPTS=-nostdinc++:-isystem/home/junwei/workspace/chromium/src/third_party/libc++/src/include:-isystem/home/junwei/workspace/chromium/src/third_party/libc++abi/src/include:-isystem/home/junwei/workspace/chromium/src/buildtools/third_party/libc++
++
++build:crcxx --cxxopt=-stdlib=libc++
++build:crcxx --features=-layering_check --features=-module_maps
++build:crcxx --cxxopt=-include/home/junwei/workspace/chromium/src/buildtools/third_party/libc++/__config_site
++# Chromium sets this in build/config/compiler/BUILD.gn, not __config_site;
++# layout-irrelevant (analysis §4), so any valid value satisfies the header check.
++build:crcxx --cxxopt=-D_LIBCPP_HARDENING_MODE=_LIBCPP_HARDENING_MODE_FAST
++# Link Chromium's own libc++ / libc++abi (fat archives rebuilt from its .o, same
++# __config_site => ABI v2 / __Cr). -nostdlib++ stops clang auto-linking -lc++/libstdc++.
++build:crcxx --linkopt=-nostdlib++
++build:crcxx --linkopt=-Wl,--start-group
++build:crcxx --linkopt=/home/junwei/workspace/webnn/_cr_libcxx_link/libc++_full.a
++build:crcxx --linkopt=/home/junwei/workspace/webnn/_cr_libcxx_link/libc++abi_full.a
++build:crcxx --linkopt=-Wl,--end-group
++
++# BAZEL_CXXOPTS puts libc++ headers on host/tool compiles too, so mirror the full
++# libc++ config (config_site + hardening + runtime archives) to the host config,
++# otherwise `[for tool]` targets fail the _LIBCPP_HARDENING_MODE header check.
++build:crcxx --host_cxxopt=-stdlib=libc++
++build:crcxx --host_cxxopt=-include/home/junwei/workspace/chromium/src/buildtools/third_party/libc++/__config_site
++build:crcxx --host_cxxopt=-D_LIBCPP_HARDENING_MODE=_LIBCPP_HARDENING_MODE_FAST
++build:crcxx --host_linkopt=-nostdlib++
++build:crcxx --host_linkopt=-Wl,--start-group
++build:crcxx --host_linkopt=/home/junwei/workspace/webnn/_cr_libcxx_link/libc++_full.a
++build:crcxx --host_linkopt=/home/junwei/workspace/webnn/_cr_libcxx_link/libc++abi_full.a
++build:crcxx --host_linkopt=-Wl,--end-group

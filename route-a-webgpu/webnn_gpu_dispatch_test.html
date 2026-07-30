@@ -1,0 +1,39 @@
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>webnn-dispatch PENDING</title></head>
+<body>
+<pre id="out">PENDING</pre>
+<script>
+async function run() {
+  const out = document.getElementById('out');
+  const log = (m) => { out.textContent += "\n" + m; console.log("[WEBNN-DISP] " + m); };
+  try {
+    const ctx = await navigator.ml.createContext({deviceType: 'gpu'});
+    log("createContext(gpu) ok");
+    const b = new MLGraphBuilder(ctx);
+    const desc = {dataType: 'float32', shape: [2, 2]};
+    const a = b.input('a', desc);
+    const c = b.constant(desc, new Float32Array([1, 2, 3, 4]));
+    const y = b.add(a, c);
+    const graph = await b.build({y});
+    log("build() ok; devices=" + JSON.stringify(graph.devices));
+
+    const aT = await ctx.createTensor({...desc, writable: true});
+    const yT = await ctx.createTensor({...desc, readable: true});
+    log("createTensor ok");
+    ctx.writeTensor(aT, new Float32Array([10, 20, 30, 40]));
+    ctx.dispatch(graph, {a: aT}, {y: yT});
+    log("dispatch() issued");
+    const res = new Float32Array(await ctx.readTensor(yT));
+    log("readTensor result=" + JSON.stringify(Array.from(res)));
+    const ok = res[0] === 11 && res[1] === 22 && res[2] === 33 && res[3] === 44;
+    log(ok ? "RESULT: INFERENCE OK (values correct)" : "RESULT: WRONG VALUES");
+  } catch (e) {
+    log("EXCEPTION: " + (e && e.message ? e.message : e));
+  }
+  document.title = "webnn-dispatch DONE";
+}
+run();
+</script>
+</body>
+</html>
