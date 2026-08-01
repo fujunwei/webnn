@@ -1,0 +1,26 @@
+diff --git a/litert/runtime/compiled_model.cc b/litert/runtime/compiled_model.cc
+index ef2a585b3..cdbafa403 100644
+--- a/litert/runtime/compiled_model.cc
++++ b/litert/runtime/compiled_model.cc
+@@ -407,7 +407,20 @@ Expected<void> LiteRtCompiledModelT::InitializeRuntime(
+   // SD-turbo attention scores) the arena high-water-mark otherwise exceeds
+   // PartitionAlloc's ~2 GiB single-allocation cap and crashes in
+   // SimpleMemoryArena::Commit. This also releases dynamic tensors promptly.
+-  interpreter_options.OptimizeMemoryForLargeTensors(1 << 20);
++  //
++  // GPU will throw an error if the model has dynamic tensors in 
++  // C:\Users\junweifu\workspace\chromium\src\third_party\tflite\src\tensorflow\lite\core\subgraph.cc
++  // if (has_dynamic_tensors_) {
++  //   TF_LITE_ENSURE_STATUS(EnsureMemoryAllocations());
++  //   TFLITE_LOG_PROD_ONCE(
++  //       tflite::TFLITE_LOG_WARNING,
++  //       "Attempting to use a delegate that only supports static-sized "
++  //       "tensors with a graph that has dynamic-sized tensors (tensor#%d is a "
++  //       "dynamic-sized tensor).",
++  //       dynamic_tensor_index_);
++  //   return kTfLiteApplicationError;
++  // }
++  // interpreter_options.OptimizeMemoryForLargeTensors(1 << 20);
+   if (jit_compilation_options) {
+     auto opaque_options = litert::OpaqueOptions::WrapCObject(
+         jit_compilation_options->options, litert::OwnHandle::kNo);

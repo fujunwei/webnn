@@ -1,0 +1,16 @@
+diff --git a/chrome/installer/mini_installer/chrome.release b/chrome/installer/mini_installer/chrome.release
+index cf4c3fa1816ed..fc9a8d9d6bf4f 100644
+--- a/chrome/installer/mini_installer/chrome.release
++++ b/chrome/installer/mini_installer/chrome.release
+@@ -31,6 +31,11 @@ libEGL.dll: %(VersionDir)s\
+ libGLESv2.dll: %(VersionDir)s\
+ libLiteRtWebGpuAccelerator.dll: %(VersionDir)s\
+ notification_helper.exe: %(VersionDir)s\
++# Prebuilt monolithic Dawn DLL (webgpu-dawn-binaries). Required because
++# libLiteRtWebGpuAccelerator.dll is built out-of-tree via Bazel and links
++# against this shared Dawn library rather than the statically-linked Dawn
++# inside chrome.dll. Copied into $root_out_dir by scripts/build_mini_installer.ps1.
++webgpu_dawn.dll: %(VersionDir)s\
+ optimization_guide_internal.dll: %(VersionDir)s\
+ resources.pak: %(VersionDir)s\
+ vk_swiftshader.dll: %(VersionDir)s\

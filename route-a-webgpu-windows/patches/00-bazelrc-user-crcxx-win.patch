@@ -1,0 +1,102 @@
+diff --git a/.bazelrc.user b/.bazelrc.user
+new file mode 100644
+index 000000000..000000001
+--- /dev/null
++++ b/.bazelrc.user
+@@ -0,0 +1,96 @@
++# crcxx_win: build ml_drift/litert with Chromium's clang-cl + Chromium's libc++
++# so the produced .dll is ABI-compatible with Chromium's webnn service DLLs
++# (which use std::__Cr::... — libc++ with _LIBCPP_ABI_NAMESPACE=__Cr).
++#
++# Without this, tflite::Subgraph containers passed across the DLL boundary get
++# reinterpreted as MSVC STL types and crash (e.g. std::length_error in
++# unordered_map::reserve at delegate_kernel.cc:226).
++#
++# Use together with --config=windows.
++#
++# ABSOLUTE PATHS BELOW ARE FOR THIS MACHINE. REPLACE:
++#   C:/Users/junweifu/workspace/chromium/src     -> your Chromium checkout
++#   C:/Users/junweifu/workspace/webnn            -> your webnn work dir
++#   -march=sierraforest                          -> your CPU target
++
++# Point Bazel's cc auto-config at Chromium's clang-cl.
++# BAZEL_LLVM + USE_CLANG_CL make Bazel's cc_configure pick clang-cl instead of cl.exe.
++build:crcxx_win --repo_env=BAZEL_LLVM=C:/Users/junweifu/workspace/chromium/src/third_party/llvm-build/Release+Asserts
++build:crcxx_win --repo_env=USE_CLANG_CL=1
++build:crcxx_win --repo_env=CC=C:/Users/junweifu/workspace/chromium/src/third_party/llvm-build/Release+Asserts/bin/clang-cl.exe
++build:crcxx_win --repo_env=USE_HERMETIC_CC_TOOLCHAIN=0
++# Note: DO NOT set --compiler=clang-cl. Bazel's Windows toolchain reports
++# compiler="msvc-cl" even when the actual tools are clang-cl (via USE_CLANG_CL=1).
++# XNNPACK and similar have select() rules keyed on compiler; the "msvc-cl" name
++# makes them skip GNU-syntax .S files that ml64.exe can't parse.
++
++# Propagate INCLUDE env from shell into compile actions.
++# The shell must set INCLUDE to `<libc++_paths>;<msvc_paths>` before `bazel clean --expunge`
++# so that windows_cc_configure.bzl records libc++ paths in cxx_builtin_include_directories.
++build:crcxx_win --action_env=INCLUDE
++build:crcxx_win --host_action_env=INCLUDE
++
++# ---- libc++ headers ----
++# -nostdinc++ disables MSVC STL system include path; -isystem adds Chromium libc++.
++# -FI (force include) __config_site so _LIBCPP_ABI_NAMESPACE=__Cr and hardening flags
++# are set the same way as Chromium's own build.
++build:crcxx_win --cxxopt=/clang:-nostdinc++
++build:crcxx_win --cxxopt=/clang:-isystem
++build:crcxx_win --cxxopt=/clang:C:/Users/junweifu/workspace/chromium/src/third_party/libc++/src/include
++build:crcxx_win --cxxopt=/clang:-isystem
++build:crcxx_win --cxxopt=/clang:C:/Users/junweifu/workspace/chromium/src/third_party/libc++abi/src/include
++build:crcxx_win --cxxopt=/clang:-isystem
++build:crcxx_win --cxxopt=/clang:C:/Users/junweifu/workspace/chromium/src/buildtools/third_party/libc++
++build:crcxx_win --cxxopt=/FIC:/Users/junweifu/workspace/chromium/src/buildtools/third_party/libc++/__config_site
++build:crcxx_win --cxxopt=-D_LIBCPP_HARDENING_MODE=_LIBCPP_HARDENING_MODE_FAST
++# Static-link libc++: suppress __declspec(dllimport) on libc++ symbols. Without
++# this, libc++ headers mark std::cout/cerr/etc as dllimport and lld-link fails
++# because our libc++.lib is a static archive, not an import lib.
++build:crcxx_win --cxxopt=-D_LIBCPP_DISABLE_VISIBILITY_ANNOTATIONS
++
++# Mirror libc++ header flags to host toolchain for `[for tool]` builds.
++build:crcxx_win --host_cxxopt=/clang:-nostdinc++
++build:crcxx_win --host_cxxopt=/clang:-isystem
++build:crcxx_win --host_cxxopt=/clang:C:/Users/junweifu/workspace/chromium/src/third_party/libc++/src/include
++build:crcxx_win --host_cxxopt=/clang:-isystem
++build:crcxx_win --host_cxxopt=/clang:C:/Users/junweifu/workspace/chromium/src/third_party/libc++abi/src/include
++build:crcxx_win --host_cxxopt=/clang:-isystem
++build:crcxx_win --host_cxxopt=/clang:C:/Users/junweifu/workspace/chromium/src/buildtools/third_party/libc++
++build:crcxx_win --host_cxxopt=/FIC:/Users/junweifu/workspace/chromium/src/buildtools/third_party/libc++/__config_site
++build:crcxx_win --host_cxxopt=-D_LIBCPP_HARDENING_MODE=_LIBCPP_HARDENING_MODE_FAST
++build:crcxx_win --host_cxxopt=-D_LIBCPP_DISABLE_VISIBILITY_ANNOTATIONS
++
++# ---- ISA features ----
++# XNNPACK per_file_copt uses -mssse3/-mavx/... on the clang branch, but Bazel
++# reports our toolchain as compiler=msvc-cl. Since the ACTUAL tool is clang-cl,
++# clang enforces per-function target-feature checks. Set a global baseline via
++# -march for the actual target CPU. For Xeon 6780E (Sierra Forest) = AVX2 + VNNI
++# + BMI2, NO AVX-512. Adjust -march for your CPU (Skylake/Icelake/etc).
++#
++# NOTE: -march=sapphirerapids or higher causes STATUS_ILLEGAL_INSTRUCTION at
++# runtime on Sierra Forest because clang emits AVX-512 auto-vectorized code.
++build:crcxx_win --copt=/arch:AVX2
++build:crcxx_win --copt=/clang:-march=sierraforest
++build:crcxx_win --copt=/clang:-mavxvnniint8
++build:crcxx_win --copt=/clang:-mavxvnniint16
++build:crcxx_win --host_copt=/arch:AVX2
++build:crcxx_win --host_copt=/clang:-march=sierraforest
++build:crcxx_win --host_copt=/clang:-mavxvnniint8
++build:crcxx_win --host_copt=/clang:-mavxvnniint16
++
++# XNNPACK AVX-512 sources: enable the full AVX-512 stack per-file (compile-time
++# only; XNNPACK's runtime dispatcher never invokes them on a CPU without AVX-512).
++build:crcxx_win --per_file_copt=external/XNNPACK/.*(avx512|avx256skx|avx256vnni).*\.c$@/clang:-mavx512f,/clang:-mavx512bw,/clang:-mavx512cd,/clang:-mavx512dq,/clang:-mavx512vl,/clang:-mavx512vnni,/clang:-mavx512bf16,/clang:-mavx512vbmi,/clang:-mavx512vbmi2,/clang:-mavx512ifma,/clang:-mvpclmulqdq,/clang:-mvaes,/clang:-mgfni,/clang:-mavx512fp16
++build:crcxx_win --host_per_file_copt=external/XNNPACK/.*(avx512|avx256skx|avx256vnni).*\.c$@/clang:-mavx512f,/clang:-mavx512bw,/clang:-mavx512cd,/clang:-mavx512dq,/clang:-mavx512vl,/clang:-mavx512vnni,/clang:-mavx512bf16,/clang:-mavx512vbmi,/clang:-mavx512vbmi2,/clang:-mavx512ifma,/clang:-mvpclmulqdq,/clang:-mvaes,/clang:-mgfni,/clang:-mavx512fp16
++
++# ---- Linker: link Chromium's libc++.lib, not MSVC's msvcp*.lib ----
++# Bazel invokes lld-link.exe directly (as tool_paths["ld"]), so /clang: prefixed
++# flags aren't consumed. We simply pass libc++.lib as a link input.
++build:crcxx_win --linkopt=C:/Users/junweifu/workspace/webnn/_cr_libcxx_link_win/libc++.lib
++build:crcxx_win --host_linkopt=C:/Users/junweifu/workspace/webnn/_cr_libcxx_link_win/libc++.lib
++# libc++.lib (from Chromium's Release build with /MD) references MSVC C++ ABI
++# helpers like __ExceptionPtrCompare/__ExceptionPtrRethrow that live in msvcp140.dll
++# (import lib msvcprt.lib). We must link these explicitly since our libc++.lib
++# doesn't carry #pragma comment directives.
++build:crcxx_win --linkopt=msvcprt.lib
++build:crcxx_win --host_linkopt=msvcprt.lib

@@ -1,0 +1,13 @@
+diff --git a/ml_drift_delegate/delegate/BUILD b/ml_drift_delegate/delegate/BUILD
+index d0650bacf..c76cb0401 100644
+--- a/ml_drift_delegate/delegate/BUILD
++++ b/ml_drift_delegate/delegate/BUILD
+@@ -170,7 +170,7 @@ cc_library(
+         "//ml_drift_delegate/delegate/serialization_weight_cache",
+         "//ml_drift_delegate/delegate/shared_memory_manager",
+         "//ml_drift_delegate/delegate/shared_memory_manager:shared_memory_manager_webgpu",
+-        "//third_party/odml/litert/weight_loader:external_weight_loader",
++        "//weight_loader:external_weight_loader",
+         "//tflite/c:common",
+     ] + select({
+         "//tools/cc_target_os:emscripten": [],

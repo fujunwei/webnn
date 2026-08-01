@@ -1,0 +1,29 @@
+diff --git a/services/webnn/public/cpp/webnn_sandbox_init.cc b/services/webnn/public/cpp/webnn_sandbox_init.cc
+index b7e4e53c3537d..bbc74c8ad86df 100644
+--- a/services/webnn/public/cpp/webnn_sandbox_init.cc
++++ b/services/webnn/public/cpp/webnn_sandbox_init.cc
+@@ -19,8 +19,22 @@ namespace webnn {
+ void PreSandboxWebNNInitialization() {
+ #if BUILDFLAG(WEBNN_USE_WEBGPU_ACCELERATOR)
+ #if BUILDFLAG(IS_WIN)
+-  base::FilePath library_path(
+-      FILE_PATH_LITERAL("libLiteRtWebGpuAccelerator.dll"));
++  // Resolve the DLL to a full path anchored at DIR_MODULE (chrome.dll's dir,
++  // i.e. the versioned dir in installed Chrome; the same dir as chrome.exe
++  // in a developer build). Without a full path Windows searches only the
++  // exe dir (Application\), which does not contain the accelerator DLL in
++  // an installed build. base::LoadNativeLibrary passes
++  // LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR internally, so once we hand it a full
++  // path Windows will also find webgpu_dawn.dll (a dependency) sitting next
++  // to the accelerator in the same directory.
++  base::FilePath library_path;
++  if (base::PathService::Get(base::DIR_MODULE, &library_path)) {
++    library_path = library_path.Append(
++        FILE_PATH_LITERAL("libLiteRtWebGpuAccelerator.dll"));
++  } else {
++    library_path = base::FilePath(
++        FILE_PATH_LITERAL("libLiteRtWebGpuAccelerator.dll"));
++  }
+   base::LoadNativeLibrary(library_path, nullptr);
+ #elif BUILDFLAG(IS_LINUX)
+   base::FilePath library_path;
