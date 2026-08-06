@@ -13,17 +13,56 @@ Idempotent: previously-injected libc++/clang entries are stripped before re-inje
 import os
 import re
 import shutil
+import subprocess
 import sys
 
 # ---- EDIT: paths for your machine ----
-BAZEL_OUTPUT_BASE = os.environ.get(
-    "BAZEL_OUTPUT_BASE",
-    r"C:\users\junweifu\_bazel_junweifu\u4haozbq",
-)
 CHROMIUM_SRC = os.environ.get(
     "CHROMIUM_SRC",
     r"C:\Users\junweifu\workspace\chromium\src",
 )
+# Where to run `bazel info output_base`. Must be a Bazel workspace.
+BAZEL_WORKSPACE = os.environ.get(
+    "BAZEL_WORKSPACE",
+    os.path.join(CHROMIUM_SRC, r"third_party\litert\src"),
+)
+
+
+def detect_output_base():
+    """Return Bazel's output_base for BAZEL_WORKSPACE, or None on failure.
+
+    `bazel info output_base` prints a forward-slash path on Windows; normalize
+    it to a Windows path so `os.path.join` produces a valid BUILD location.
+    """
+    env_override = os.environ.get("BAZEL_OUTPUT_BASE")
+    if env_override:
+        return env_override
+    try:
+        result = subprocess.run(
+            ["bazel", "info", "output_base"],
+            cwd=BAZEL_WORKSPACE,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except (FileNotFoundError, subprocess.CalledProcessError) as e:
+        print(
+            f"ERROR: failed to run `bazel info output_base` in {BAZEL_WORKSPACE}: {e}",
+            file=sys.stderr,
+        )
+        return None
+    path = result.stdout.strip().replace("/", "\\")
+    return path
+
+
+BAZEL_OUTPUT_BASE = detect_output_base()
+if not BAZEL_OUTPUT_BASE:
+    print(
+        "Set BAZEL_OUTPUT_BASE=<path> or BAZEL_WORKSPACE=<dir> and retry.",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+print(f"Bazel output_base: {BAZEL_OUTPUT_BASE}")
 
 BUILD = os.path.join(BAZEL_OUTPUT_BASE, r"external\local_config_cc\BUILD")
 

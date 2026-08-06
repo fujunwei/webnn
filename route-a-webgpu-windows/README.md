@@ -173,7 +173,9 @@ $text  = [System.Text.Encoding]::ASCII.GetString($bytes)
 ### 5.1 dev 目录直接跑（推荐迭代方式）
 
 ```powershell
-& "$BUNDLE\scripts\deploy_to_chrome.ps1" -ChromeOutDir "$CR\out\Release" -Mode dbg -ChromiumSrc $CR -WebnnDir $WEBNN
+& "$BUNDLE\scripts\deploy_to_chrome.ps1" -ChromeOutDir "$CR\out\Release" -Mode opt -ChromiumSrc $CR -WebnnDir $WEBNN
+
+& "$BUNDLE\scripts\deploy_to_chrome.ps1" -ChromeOutDir "$CR\out\upstream_bots_debug" -Mode dbg -ChromiumSrc $CR -WebnnDir $WEBNN
 
 # 用测试页跑一遍
 & "$CR\out\Release\chrome.exe" `
