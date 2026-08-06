@@ -335,3 +335,273 @@ execution plan 塌缩到 2 个节点：`Delegate{Add,Mul}`（idx 0）、
 - 如果 delegated subgraph 里重新出现动态张量，TFLite 会打印
   `"only supports static-sized tensors (tensor#N …)"` — 由此定位哪个
   大张量还需要留在 arena（或落进受支持的算子）。
+
+---
+
+# SAM encoder 上被 GPU delegate 拒绝的算子分布
+
+## 数据来源
+
+来自 [route-a-webgpu-windows/patches/10-ml-drift-log-unsupported-op-counts.patch](../route-a-webgpu-windows/patches/10-ml-drift-log-unsupported-op-counts.patch)
+（在 ml-drift `GetOpsToReplaceWithOptions` 里把 lambda 拒绝的节点按 opcode
+计数并追加到 `TF_LITE_KERNEL_LOG`）。跑
+`segment_anything_encoder.tflite` 一次，得到：
+
+```
+Following operations are not supported by GPU delegate:
+ADD: Can't parse inputs with const tensors.
+ADD: Tensor "" has bad input dims size: 0.
+ADD: Tensor dimensions must be less than 5.
+CAST: Tensor type(INT64) is not supported.
+DEQUANTIZE:
+DIV: Op can only handle 1 or 2 operand(s).
+GATHER: Only support 1D indices
+LESS: Can't parse inputs with const tensors.
+MAXIMUM: Can't parse inputs with const tensors.
+MINIMUM: Can't parse inputs with const tensors.
+RESHAPE: Tensor "" has bad input dims size: 6.
+RESHAPE: Tensor dimensions must be less than 5.
+SELECT_V2: Tensor type(INT64) is not supported.
+TRANSPOSE: Expected 1 runtime input tensor(s), but node has 0 runtime input(s).
+TRANSPOSE: Permutation for transpose is invalid.
+TRANSPOSE: Tensor "" has bad input dims size: 6.
+102 operations will run on the GPU, and the remaining 1594 operations will run on the CPU.
+Unsupported node counts by opcode (nodes rejected before partitioning):
+  RESHAPE: 128
+  TRANSPOSE: 88
+  ADD: 72
+  CAST: 24
+  DIV: 24
+  GATHER: 24
+  LESS: 24
+  MAXIMUM: 24
+  MINIMUM: 24
+  SELECT_V2: 24
+Created TensorFlow Lite XNNPACK delegate for CPU.
+```
+
+上面 `Following operations are not supported` 段是 tflite
+`GraphPartitionHelper::PrepareSupportedNodes` 用 `std::set<std::string>` 去重后
+的**每种"op: 原因"字符串**；下面 `Unsupported node counts by opcode` 段是
+patch 10 追加的**按 opcode 累加的节点数**。同一 opcode 的多个不同原因合并计数。
+
+## 汇总（按数量降序，共 456 个节点被拒）
+
+| # | Opcode | 数量 | 已知原因（来自 log） |
+|---|---|---:|---|
+| 1 | `RESHAPE` | 128 | rank 5、rank 6 |
+| 2 | `TRANSPOSE` | 88 | 无 runtime 输入 / 非法 permutation / rank 6 |
+| 3 | `ADD` | 72 | 常量+常量 / rank 0 标量 / rank ≥ 5 |
+| 4 | `CAST` | 24 | INT64 |
+| 5 | `DIV` | 24 | 操作数个数 > 2 |
+| 6 | `GATHER` | 24 | indices 非 1-D |
+| 7 | `LESS` | 24 | 常量+常量 |
+| 8 | `MAXIMUM` | 24 | 常量+常量 |
+| 9 | `MINIMUM` | 24 | 常量+常量 |
+| 10 | `SELECT_V2` | 24 | INT64 |
+
+`102 / 1596`（GPU / 总节点）= **6.4%** 命中率。把上表最大的三项拿下（`RESHAPE + TRANSPOSE + ADD = 288`）就能翻近 3 倍。
+
+## 按"改起来性价比"分类
+
+按修复的 **单位 opcode 收益 / 工作量比** 分三档。
+
+### A 档：一次修复一整片
+
+**A1. `RESHAPE` / `TRANSPOSE` 的 rank≥5、rank=6**（120 + 40 ≈ 160 个）
+
+SAM encoder 里的 patch embedding 与相对位置编码经常引入 5D、6D 张量。ml-drift
+kernel 内部按 BHWC + Batch/Depth 处理，rank>4 直接拒。
+
+三种可能路径：
+
+1. **在 ml-drift `ReshapeOperationParser::IsSupported` 里放宽 rank**：如果
+   reshape 的输入和输出在一个 batch 维度上就能压回 4D（例如 `[B,H,W,g,C/g]` →
+   `[B,H,W,C]`），插一层"合并/展开的 view 张量"支持它。风险中等（改动核心
+   layout 推断）。
+2. **在 WebNN 侧或建图前把 5D/6D 拍平**：`GraphBuilderTflite` 在遇到
+   `mojom::Reshape` / `mojom::Transpose` 时，如果目标 shape 有连续可折叠维度，
+   等价地合并它们再发给 tflite。风险最低，且这些 reshape 本来就是 view，
+   语义等价。**推荐先试这条。**
+3. **在 LiteRT 的 `optimize` pass 里加个 `MergeConsecutiveViewOps`**：也可行，
+   但影响面比方案 2 大。
+
+**A2. `RESHAPE` 的 rank 5**：属于 A1 的子集，同一改法。
+
+**A3. `TRANSPOSE: Expected 1 runtime input tensor(s), but node has 0 runtime input(s).`**
+
+意思是 `TRANSPOSE` 的 permutation 张量是常量（builder 侧把两个输入都塞进
+constant），运行时 `inputs->size` 为 1（只算 dtype 非 kTfLiteInt32
+的运行时输入），ml-drift 的 `PreCheckReadValue` 断言是 0，拒。
+`TransposeOperationParser::Parse` 期望 permutation 出现在 `inputs[1]`。
+
+修复：在 WebNN 建图或 LiteRT convert 时，让 permutation 走 tflite operator
+的**第二个输入槽**（依然是 constant），不要直接常量折叠掉。改动应该在
+`services/webnn/tflite/graph_builder_tflite.cc` 的 `SerializeTranspose*`
+路径。**低风险，收益立竿见影**。
+
+**A4. `TRANSPOSE: Permutation for transpose is invalid`**
+
+ml-drift 只支持 4D 的 `TransposeAttributes`（`Perm4D` 结构）。permutation
+里含非 0..3 的分量（比如 5D permutation 里的 `4`）→ 拒。跟着 A1
+一起处理：如果我们能保证 rank ≤ 4，这条自然就消失。
+
+### B 档：单类型问题，改起来集中
+
+**B1. `CAST: INT64` + `SELECT_V2: INT64`**（24 + 24 = 48 个）
+
+SAM 里的 int64 常来自 top-k / index 计算。ml-drift 只允许
+{f32, f16, i32, i8, u8, bool}。
+
+三种可能：
+
+- **上游 tflite converter 阶段就把 int64 常量降到 int32**（比如
+  `services/webnn/tflite/graph_builder_tflite.cc` 里 constant 张量下发时如果原
+  op 是 index 用途，dtype 用 int32）。这是最省事的。
+- **ml-drift 里给 CAST/SELECT_V2 支持 int64**：需要新增一条 dtype 分支到
+  两个 kernel + tensor descriptor。工作量中等。
+- **在 tflite `optimize` pass 里替换 int64 张量为 int32**（前提是值范围能
+  塞下）。
+
+**B2. `GATHER: Only support 1D indices`**（24 个）
+
+`GatherOperationParser::IsSupported` 要求 `indices.dims->size == 1`。SAM 里
+attention 有 2-D indices。修复思路：
+- 在建图侧 reshape indices 到 1-D，输出再 reshape 回去。
+- 或者在 ml-drift 里加一条 2-D indices 分支（把 outer dim 当 batch）。
+
+**B3. `DIV: Op can only handle 1 or 2 operand(s)`**（24 个）
+
+看着像 tflite `DIV_N` 或 fused div-with-broadcast 的变体。需要 dump 出这
+24 个 DIV 节点的 `inputs->size` 与 fused 属性看具体是哪种。若都是同一种
+fused div，加一个 handler；若是 broadcast div，通常和 ADD 那批一起处理。
+
+### C 档：小片修复，但影响不大
+
+**C1. `ADD / LESS / MAXIMUM / MINIMUM: Can't parse inputs with const tensors`**
+（72 + 24 + 24 + 24 = 144 个，其中 ADD 里"常量+常量"分量未知）
+
+`ml_drift_delegate` 的元素级 handler 要求至少 1 个 runtime 输入。所有输入都是
+constant 时（图上通常是 constant-folding 的漏网之鱼），parse 失败。修复：
+- **在 tflite 侧 constant-fold**：这类节点跑一次也无害，让 tflite 的
+  `optimize` pass 提前算掉它们即可。ml-drift 就看不到了。
+- **或者在 ml-drift 里加 "全常量 → materialize constant 输出" 分支**：改动
+  更集中，但对每个 elementwise handler 都要动。
+
+**C2. `ADD: rank 0`（标量常量 + 张量）**
+
+标量常量在 tflite 里 shape 为 `[]`，ml-drift 期望的 `BHWC` 至少 rank 1。
+建图侧对标量 constant reshape 成 `[1]` 即可。
+
+**C3. `ADD: rank ≥ 5`**：跟 A1 一起处理。
+
+**C4. `DEQUANTIZE:`**（数量未在 counts 段出现，说明它落在 partition 内被吸收 —
+或空 details 未 hash，去重成了 1 条）：SAM encoder 无量化，可暂时忽略；如果之
+后跑量化模型再回头看。
+
+## 建议的推进顺序
+
+优先按"节点数 × 单个 CL 覆盖多类"排序：
+
+1. **[A3] Transpose permutation 常量下发问题** — 期望：`TRANSPOSE` 88 中大约
+   40-60 个消失，无风险。
+2. **[A1] rank≥5 的 reshape/transpose 合并** — 期望：`RESHAPE` 128 + 剩余
+   `TRANSPOSE` 一起下降，可能一次 CL 拿掉 ~180 个。
+3. **[B1] int64 → int32 常量降级** — 期望：`CAST` 24 + `SELECT_V2` 24 = 48
+   全消。
+4. **[C1] constant-only elementwise 折叠** — 期望：144 个消失或大幅缩水。
+5. 剩下 GATHER / DIV 依样处理。
+
+每一步跑完看 counts 是否符合预期，再决定下一步。
+
+## 记账模板
+
+| 迭代 | 修改 | GPU 节点 | CPU 节点 | 备注 |
+|---|---|---:|---:|---|
+| 基线 | — | 102 | 1594 | 本节数据 |
+| 1 | [A3+A1] transpose 常量输入 + rank-5 拆解（v1） | 102 | 1618 | patch 11 v1；A1 净负 (+24 RESHAPE)，A3 未命中 |
+| 2 | [A3] transpose 常量输入 + DEQ(const) 链折叠（v2） | 待测 | 待测 | patch 11 v2；回滚 A1，扩 A3 |
+| 3 | [B1] int64 常量降级 | | | |
+| 4 | [C1] const-only elementwise | | | |
+| 5 | [B2] gather 2-D indices | | | |
+| 6 | [B3] div fused | | | |
+
+## 迭代 1 复盘（patch 11 v1）
+
+原始 patch 11 同时打了 A3 与 A1（TRANSPOSE 拆解）。实测：
+
+```
+102 GPU, 1618 CPU
+RESHAPE: 152 (+24)
+TRANSPOSE: 76 (-12)
+```
+
+Δ CPU = +24 = Δ RESHAPE 完全吃掉 Δ TRANSPOSE 的减量：
+
+- **A1 的 -12 TRANSPOSE**：来源于 12 个 rank-5 transpose 被 A1 拆
+  成 `RESHAPE + TRANSPOSE + TRANSPOSE`。中间那次 rank-4 transpose 被
+  接受，但两侧的 RESHAPE 都是 rank-5 → 被 ml-drift 的
+  `RESHAPE: Tensor dimensions must be less than 5.` 拒。净得
+  `-12 TRANSPOSE + 24 RESHAPE`。**A1 是净负**，需要回滚。
+- **A3 的 0 命中**：说明 SAM encoder 的 `mojom::Transpose.input_operand_id`
+  在 mojom 层不是 `Kind::kConstant`，而是走了 `DequantizeLinear` 的中间
+  operand。真正会导致 "0 runtime inputs" 的机制是 tflite 的
+  `FP16GraphPartitionHelper::IsNodeSupported`：它对
+  `DEQUANTIZE(fp16 mmap const)` 建立 `constant_dequant_map_`，然后为
+  后续节点做 `RemapFp16InputTensors`——把 transpose 的 `input[0]` 临时
+  改指回 fp16 mmap 常量，让 `gpu_compatibility.cc` 的
+  `GetNumberOfRuntimeInputs` 数出 0 个 runtime 输入。
+
+## 迭代 2（patch 11 v2 - 当前）
+
+`route-a-webgpu-windows/patches/11-webnn-transpose-fold-const-and-deq-chain.patch`：
+
+### 回滚 A1
+
+删掉 `TryReduceTransposeRank` 及 `FoldedTransposePlan`；`SerializeTranspose`
+不再对 rank-5 transpose 做 reshape 包装。保留 `SerializeTransposeOperation`
+的 permutation `uint32_t → int32_t` 的小修正（对齐 ml-drift
+`Tensor<Linear, INT32>` 的读法）以及 `SerializeOperation` 分发循环里的
+`if (!operator_offset.IsNull())` 判断（handler 可以返回空 offset 表示
+"整段被生前折叠"）。
+
+### 扩 A3：直连常量 + DEQ(const) 链折叠
+
+`GraphBuilderTflite::TryConstantFoldTranspose` 现在处理两种模式：
+
+- **Case A — `Transpose(kConstant)`**：读原始字节，按 permutation 复制
+  出新的 mmap constant tensor，注册到 `output_operand_id` 的
+  `operand_to_tensor_info_map_` 上，返回空 offset。dtype 不变（fp16 保
+  持 fp16，int8 保持 int8，等等），子字节类型（`int4`/`uint4`）不折。
+
+- **Case B — `Transpose(DequantizeLinear(kConstant))`**：把 DEQ 数学与
+  permutation 一起在建图期算掉，落成 fp32 mmap constant。触发条件：
+
+  1. DEQ 的输入是 `kConstant`；
+  2. DEQ 输出只有这一个 transpose 消费者（`operand_to_dependent_operations_`
+     里 size==1）；
+  3. scale / zero_point 都是标量常量（`NumberOfElements() == 1`），暂
+     不支持 per-channel（需要跟踪 channel 轴经 permutation 到哪一维，
+     交后续 CL）；
+  4. 源 dtype 属于 {fp16, fp32, int8, uint8, int32}。
+
+  计算路径：`fp32[i] = (source[i] - zp) * scale`，再按 permutation 落到
+  fp32 mmap buffer。同时把 `lazy_serialized_dequantize_operations_` 里
+  对应的 `serialized` 标记为 true，防止原 DEQ 被再次 emit。
+
+  产物是一个 fp32 mmap constant，`operand_to_tensor_info_map_` 直接指
+  向它。下游 op（通常是 MATMUL）通过 `SerializeInputTensorInfo` 拿到的
+  就是 fp32 TensorInfo，不会再触发 `constant_input_tensor` 的 CAST
+  折半分支，因此 `FP16GraphPartitionHelper` 也不会重映射到 mmap 常量。
+  MATMUL 之类的 op 只要求 1 个 runtime 输入（activation），第 2 输入
+  是常量本身就允许。
+
+### 副作用
+
+- **空间**：Case B 会把 fp16 常量翻倍写成 fp32；SAM encoder 里的常量总
+  大小几百 MB，翻倍到 GB 级需要留意 flatbuffer 上限。若命中面过大，可
+  以在后续 CL 里改成 "生成 fp16 permuted constant + 保留一次 CAST /
+  DEQUANTIZE"，代价是需要给 `SerializeCastOperation` 加一条 "输入 tensor
+  已是 mmap const" 的旁路，工作量更大。
+- **精度**：`(v - zp) * scale` 在 fp32 里算，量化和 fp16 场景语义等价，
+  没有额外的舍入误差引入。
