@@ -1,0 +1,63 @@
+[0814/154329.849:ERROR:services\webnn\tflite\sam_runner\sam_encoder_runner.cc:499] [runner] model=C:/Users/junweifu/workspace/tflite-dump-model/ml_drfit_add.tflite bytes=488
+INFO: [environment.cc:36] Creating LiteRT environment with options
+INFO: [gpu_registry.cc:101] Attempting to load GPU accelerator(l).
+INFO: [gpu_registry.cc:101] Attempting to load GPU accelerator(l).
+INFO: [accelerator_registry.cc:54] RegisterAccelerator: ptr=00004078000AC1E0, name=GPU WebGPU
+INFO: [gpu_registry.cc:109] Dynamically loaded GPU accelerator(libLiteRtWebGpuAccelerator.dll) registered.
+INFO: [accelerator_registry.cc:54] RegisterAccelerator: ptr=00004078000AC4E0, name=CpuAccelerator
+INFO: [cpu_registry.cc:75] XNNPACK CPU accelerator registered.
+[0814/154329.873:ERROR:services\webnn\tflite\sam_runner\sam_encoder_runner.cc:355] [verify] compiling CPU reference (fp32)...
+INFO: [compiled_model.cc:827] Flatbuffer model initialized directly from incoming litert model.
+[webnn-oom] OptimizeMemoryForLargeTensors: converted=0 skipped_input=0 skipped_bytes=0 total=0
+[webnn-oom] OptimizeMemoryForLargeTensors: converted=0 skipped_input=0 skipped_bytes=2 total=3
+[webnn-oom] OptimizeMemoryForLargeTensors: converted=0 skipped_input=0 skipped_bytes=2 total=3
+Created TensorFlow Lite XNNPACK delegate for CPU.
+[webnn-delegate] ModifyGraphWithDelegateImpl: flags=5 supports_dynamic=1 hint_full=0 pre_state=0
+[webnn-delegate] STEP3: no allocation needed
+[0814/154329.879:ERROR:services\webnn\tflite\sam_runner\sam_encoder_runner.cc:376] [verify] input elems=4 (ramp i*0.25)
+========webnn litert SimpleMemoryArena::Commit requesting 0 bytes (0.00 MB), exceeds PartitionAlloc 2GB limit: no
+========webnn litert SimpleMemoryArena::Commit requesting 0 bytes (0.00 MB), exceeds PartitionAlloc 2GB limit: no
+[0814/154329.879:ERROR:services\webnn\tflite\sam_runner\sam_encoder_runner.cc:331] [verify-cpu] output: elems=4 nan=0 min=1 max=4.75 mean=2.875 std=1.39754
+[0814/154329.879:ERROR:services\webnn\tflite\sam_runner\sam_encoder_runner.cc:340] [verify-cpu] output values=[1,2.25,3.5,4.75]
+[0814/154329.879:ERROR:services\webnn\tflite\sam_runner\sam_encoder_runner.cc:397] [verify] compiling GPU model (fp32)...
+INFO: [compiled_model.cc:827] Flatbuffer model initialized directly from incoming litert model.
+[webnn-oom] OptimizeMemoryForLargeTensors: converted=0 skipped_input=0 skipped_bytes=0 total=0
+[webnn-oom] OptimizeMemoryForLargeTensors: converted=0 skipped_input=0 skipped_bytes=2 total=3
+[webnn-oom] OptimizeMemoryForLargeTensors: converted=0 skipped_input=0 skipped_bytes=2 total=3
+WARNING: All log messages before absl::InitializeLog() is called are written to STDERR
+I0000 00:00:1786693409.881865   40404 delegate_webgpu.cc:217] Create WebGPU environment (use_low_power=false, enable_host_mapped_pointer=true)
+I0000 00:00:1786693409.996232   40404 environment.cc:525] Selected adapter: Microsoft Basic Render Driver, arch=warp, vendor=microsoft, backend=Direct3D 12, adapterType=CPU / Software
+I0000 00:00:1786693410.009053   40404 delegate_webgpu.cc:244] Created a WebGPU environment.
+INFO: [environment.cc:47] Adding options to the existing LiteRT environment
+INFO: [gpu_environment.cc:367] Failed to create OpenCL context.
+INFO: [gpu_environment.h:155] Created LiteRT GpuEnvironment.
+INFO: [environment.cc:47] Adding options to the existing LiteRT environment
+I0000 00:00:1786693410.009476   40404 delegate_webgpu.cc:701] # of threads to upload weights = 0
+I0000 00:00:1786693410.009564   40404 delegate_webgpu.cc:709] # of threads to compile kernels = 0
+[webnn-delegate] ModifyGraphWithDelegateImpl: flags=1 supports_dynamic=1 hint_full=0 pre_state=0
+I0000 00:00:1786693416.002945   40404 delegate_kernel.cc:871] Initializing WebGPU-based API from graph.
+[webnn-delegate] STEP3: no allocation needed
+[0814/154336.045:ERROR:services\webnn\tflite\sam_runner\sam_encoder_runner.cc:412] [verify] GPU model IsFullyAccelerated=1
+[0814/154336.045:ERROR:services\webnn\tflite\sam_runner\sam_encoder_runner.cc:136] [verify-gpu-compile] LiteRT diagnostics:
+[WebNN][GPU-delegate] All 1 operations are supported by GPU delegate.
+========[WebNN][delegate_webgpu.cc] 1 ops on GPU, 0 ops on CPU
+[WebNN][delegate] DelegatePrepare: replacing 1 ops
+[WebNN][delegate] BuildFinalModel START
+[WebNN][BuildFinalModel] BuildModel START
+[WebNN][BuildFinalModel] BuildModel DONE, running transformations...
+[WebNN][BuildFinalModel] Transformations DONE
+[WebNN][delegate] BuildFinalModel DONE
+[WebNN][delegate] GraphToGpuModel START (1 nodes)
+[WebNN][delegate] GraphToGpuModel DONE
+[WebNN][delegate] ReplaceNodeSubsetsWithDelegateKernels OK
+
+========webnn litert SimpleMemoryArena::Commit requesting 0 bytes (0.00 MB), exceeds PartitionAlloc 2GB limit: no
+========webnn litert SimpleMemoryArena::Commit requesting 0 bytes (0.00 MB), exceeds PartitionAlloc 2GB limit: no
+[0814/154336.086:ERROR:services\webnn\tflite\sam_runner\sam_encoder_runner.cc:331] [verify-gpu] output: elems=4 nan=0 min=1 max=2.75 mean=1.875 std=0.673146
+[0814/154336.086:ERROR:services\webnn\tflite\sam_runner\sam_encoder_runner.cc:340] [verify-gpu] output values=[1,2.25,1.5,2.75]
+[0814/154336.086:ERROR:services\webnn\tflite\sam_runner\sam_encoder_runner.cc:466] [verify] elems=4 tol=0.01 max_abs=2 mean_abs=1 over_tol=2 nan_mismatch=0
+[0814/154336.086:ERROR:services\webnn\tflite\sam_runner\sam_encoder_runner.cc:470] [verify] FAIL
+I0000 00:00:1786693416.099939   40404 delegate_webgpu.cc:274] Destroyed the WebGPU environment.
+INFO: [accelerator_registry.cc:43] DestroyAccelerator: ptr=00004078000AC4E0, name=CpuAccelerator
+INFO: [accelerator_registry.cc:43] DestroyAccelerator: ptr=00004078000AC1E0, name=GPU WebGPU
+EXIT=2

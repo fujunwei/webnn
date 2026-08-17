@@ -1,0 +1,22 @@
+litert: document kTfLiteDelegateFlagsAllowDynamicTensors
+
+Adds a commented-out flag block explaining the dynamic-tensors option
+for use with OptimizeMemoryForLargeTensors.
+
+diff --git a/ml_drift_delegate/delegate/delegate_webgpu.cc b/ml_drift_delegate/delegate/delegate_webgpu.cc
+index 9578cbb66..fd26fc43e 100644
+--- a/ml_drift_delegate/delegate/delegate_webgpu.cc
++++ b/ml_drift_delegate/delegate/delegate_webgpu.cc
+@@ -704,6 +739,12 @@ TfLiteDelegatePtr CreateMlDriftWebGpuDelegate(MlDriftDelegateOptionsPtr options,
+                              LiteRtDeleteMlDriftWebGpuDelegate);
+   delegate->data_ = delegate_data.release();
+   delegate->Prepare = DelegatePrepare;
++  // Allow dynamic-allocation tensors (kTfLiteDynamic from
++  // OptimizeMemoryForLargeTensors). These have static shapes but use
++  // malloc instead of arena allocation, reducing arena memory pressure.
++  // Without this flag, TFLite rejects the delegate when any tensor uses
++  // kTfLiteDynamic allocation.
++  // delegate->flags |= kTfLiteDelegateFlagsAllowDynamicTensors;
+   if (hint_fully_delegated_to_single_delegate) {
+     delegate->flags |= kTfLiteDelegateFlagsHintFullyDelegatedToSingleDelegate;
+   }

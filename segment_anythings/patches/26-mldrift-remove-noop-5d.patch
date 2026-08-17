@@ -1,0 +1,30 @@
+ml-drift: skip 5D identity-reshape in RemoveIdentityReshape
+
+Avoids std::bad_any_cast for Reshape3DAttributes by detecting the 5D
+variant and skipping it (a 5D reshape is never a simple identity).
+
+diff --git a/ml_drift/common/transformations/remove_noop.cc b/ml_drift/common/transformations/remove_noop.cc
+index 3a1b308..834b919 100644
+--- a/ml_drift/common/transformations/remove_noop.cc
++++ b/ml_drift/common/transformations/remove_noop.cc
+@@ -109,9 +109,17 @@ class RemoveIdentityReshape : public NodeTransformation {
+       return {TransformStatus::SKIPPED, ""};
+     }
+     auto input_shape = graph->FindInputs(node->id)[0]->tensor.shape;
+-    const auto& reshape_attr =
+-        std::any_cast<const ReshapeAttributes&>(node->operation.attributes);
+-    if (input_shape != reshape_attr.new_shape) {
++    // Handle both 4D (ReshapeAttributes) and 5D (Reshape3DAttributes).
++    if (auto* attr4d = std::any_cast<ReshapeAttributes>(&node->operation.attributes)) {
++      if (input_shape != attr4d->new_shape) {
++        return {TransformStatus::SKIPPED, ""};
++      }
++    } else if (auto* attr5d = std::any_cast<Reshape3DAttributes>(&node->operation.attributes)) {
++      // For 5D reshape, we can't easily compare with BHWC input_shape.
++      // A 5D reshape is never a simple identity (the rank changes),
++      // so just skip.
++      return {TransformStatus::SKIPPED, ""};
++    } else {
+       return {TransformStatus::SKIPPED, ""};
+     }
+     {

@@ -1,0 +1,33 @@
+litert: add stub //third_party/odml/litert/weight_loader package
+
+Adds an alias package so internal //third_party/odml/... labels resolve
+without patching upstream BUILD files.
+
+diff --git a/third_party/odml/litert/weight_loader/BUILD b/third_party/odml/litert/weight_loader/BUILD
+new file mode 100644
+--- /dev/null
++++ b/third_party/odml/litert/weight_loader/BUILD
+@@ -0,0 +1,23 @@
++# Copyright 2026 The Chromium Authors
++# Use of this source code is governed by a BSD-style license that can be
++# found in the LICENSE file.
++#
++# Stub package that forwards the Google-internal label path
++# `//third_party/odml/litert/weight_loader:external_weight_loader` to the
++# publicly checked-in package at `//weight_loader:external_weight_loader`.
++#
++# Some upstream BUILD files still reference the internal label without the
++# `# copybara:uncomment` guard (see for example
++# ml_drift_delegate/delegate/BUILD:173,
++# ml_drift_delegate/delegate/shared_memory_manager/BUILD:226,
++# ml_drift_delegate/delegate/shared_memory_manager/BUILD:339). Bazel refuses
++# to load them because the internal package does not exist in the mirrored
++# source. This alias package makes those labels resolve without patching
++# upstream BUILD files.
++
++package(default_visibility = ["//visibility:public"])
++
++alias(
++    name = "external_weight_loader",
++    actual = "//weight_loader:external_weight_loader",
++)

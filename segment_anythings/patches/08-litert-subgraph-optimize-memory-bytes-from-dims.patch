@@ -1,0 +1,44 @@
+tflite: compute tensor bytes from dims in OptimizeMemoryForLargeTensors
+
+Before the first AllocateTensors call tensor->bytes may be 0; compute it
+from dims and element size so large tensors are correctly moved to
+dynamic allocation.
+
+diff --git a/tflite/core/subgraph.cc b/tflite/core/subgraph.cc
+index cb2ec7b85..ae00609e5 100644
+--- a/tflite/core/subgraph.cc
++++ b/tflite/core/subgraph.cc
+@@ -2111,7 +2125,32 @@ void Subgraph::OptimizeMemoryForLargeTensors(
+   for (size_t tensor_index = 0; tensor_index < context_.tensors_size;
+        tensor_index++) {
+     TfLiteTensor* tensor = &context_.tensors[tensor_index];
+-    if (tensor->bytes >= large_tensors_thresholds_in_bytes &&
++    // Compute bytes from dims if not yet populated (bytes may be 0 before
++    // the first AllocateTensors call).
++    size_t tensor_bytes = tensor->bytes;
++    if (tensor_bytes == 0 && tensor->dims != nullptr &&
++        tensor->dims->size > 0) {
++      int64_t num_elements = 1;
++      for (int i = 0; i < tensor->dims->size; ++i) {
++        if (tensor->dims->data[i] < 0) break;  // dynamic dim, skip
++        num_elements *= tensor->dims->data[i];
++      }
++      // Compute per-element size.
++      int elem_size = 4;  // default float32
++      switch (tensor->type) {
++        case kTfLiteFloat32: elem_size = 4; break;
++        case kTfLiteFloat16: elem_size = 2; break;
++        case kTfLiteInt32:   elem_size = 4; break;
++        case kTfLiteInt64:   elem_size = 8; break;
++        case kTfLiteInt8:
++        case kTfLiteUInt8:   elem_size = 1; break;
++        case kTfLiteInt16:   elem_size = 2; break;
++        case kTfLiteBool:    elem_size = 1; break;
++        default:             elem_size = 4; break;
++      }
++      tensor_bytes = static_cast<size_t>(num_elements * elem_size);
++    }
++    if (tensor_bytes >= static_cast<size_t>(large_tensors_thresholds_in_bytes) &&
+         tensor->allocation_type == kTfLiteArenaRw &&
+         // Skip input tensors since they are handled by ResizeInputTensor().
+         std::find(inputs_.begin(), inputs_.end(), tensor_index) ==

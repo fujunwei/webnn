@@ -1,0 +1,86 @@
+[0814/155622.740:ERROR:services\webnn\tflite\sam_runner\sam_encoder_runner.cc:499] [runner] model=C:/Users/junweifu/workspace/tflite-dump-model/new_segment_anything_encoder.tflite bytes=183899272
+INFO: [environment.cc:36] Creating LiteRT environment with options
+INFO: [gpu_registry.cc:101] Attempting to load GPU accelerator(l).
+INFO: [gpu_registry.cc:101] Attempting to load GPU accelerator(l).
+INFO: [accelerator_registry.cc:54] RegisterAccelerator: ptr=00007DB0000A0240, name=GPU WebGPU
+INFO: [gpu_registry.cc:109] Dynamically loaded GPU accelerator(libLiteRtWebGpuAccelerator.dll) registered.
+INFO: [accelerator_registry.cc:54] RegisterAccelerator: ptr=00007DB0000A0540, name=CpuAccelerator
+INFO: [cpu_registry.cc:75] XNNPACK CPU accelerator registered.
+[0814/155622.761:ERROR:services\webnn\tflite\sam_runner\sam_encoder_runner.cc:542] [runner] CompiledModel::Create START (mode=gpu-only)
+INFO: [compiled_model.cc:827] Flatbuffer model initialized directly from incoming litert model.
+[webnn-oom] OptimizeMemoryForLargeTensors: converted=0 skipped_input=0 skipped_bytes=0 total=0
+[webnn-oom] OptimizeMemoryForLargeTensors: converted=1054 skipped_input=1 skipped_bytes=230 total=1840
+[webnn-oom] OptimizeMemoryForLargeTensors: converted=0 skipped_input=1 skipped_bytes=230 total=1840
+WARNING: All log messages before absl::InitializeLog() is called are written to STDERR
+I0000 00:00:1786694182.781961   30000 delegate_webgpu.cc:217] Create WebGPU environment (use_low_power=false, enable_host_mapped_pointer=true)
+I0000 00:00:1786694182.915078   30000 environment.cc:525] Selected adapter: Microsoft Basic Render Driver, arch=warp, vendor=microsoft, backend=Direct3D 12, adapterType=CPU / Software
+I0000 00:00:1786694182.937078   30000 delegate_webgpu.cc:244] Created a WebGPU environment.
+INFO: [environment.cc:47] Adding options to the existing LiteRT environment
+INFO: [gpu_environment.cc:367] Failed to create OpenCL context.
+INFO: [gpu_environment.h:155] Created LiteRT GpuEnvironment.
+INFO: [environment.cc:47] Adding options to the existing LiteRT environment
+I0000 00:00:1786694182.937605   30000 delegate_webgpu.cc:701] # of threads to upload weights = 0
+I0000 00:00:1786694182.937729   30000 delegate_webgpu.cc:709] # of threads to compile kernels = 0
+[webnn-delegate] ModifyGraphWithDelegateImpl: flags=1 supports_dynamic=1 hint_full=0 pre_state=0
+I0000 00:00:1786694189.340672   30000 delegate_kernel.cc:871] Initializing WebGPU-based API from graph.
+E0000 00:00:1786694193.041311   30000 environment.cc:104] Validation error: Error while parsing WGSL: :12:25 error: 'f16' type used without 'f16' extension enabled
+const Bt_buffer = array<f16, 36>(
+                        ^^^
+
+
+ - While calling [Device].CreateShaderModule([ShaderModuleDescriptor]).
+
+E0000 00:00:1786694193.041514   30000 environment.cc:104] Validation error: [Invalid ShaderModule (unlabeled)] is invalid due to a previous error.
+ - While validating compute stage ([Invalid ShaderModule (unlabeled)], entryPoint: "main").
+ - While calling [Device].CreateComputePipeline([ComputePipelineDescriptor]).
+
+E0000 00:00:1786694193.043652   30000 environment.cc:104] Validation error: Error while parsing WGSL: :24:25 error: 'f16' type used without 'f16' extension enabled
+const At_buffer = array<f16, 24>(
+                        ^^^
+
+
+ - While calling [Device].CreateShaderModule([ShaderModuleDescriptor]).
+
+E0000 00:00:1786694193.043692   30000 environment.cc:104] Validation error: [Invalid ShaderModule (unlabeled)] is invalid due to a previous error.
+ - While validating compute stage ([Invalid ShaderModule (unlabeled)], entryPoint: "main").
+ - While calling [Device].CreateComputePipeline([ComputePipelineDescriptor]).
+
+[webnn-delegate] STEP3: no allocation needed
+[0814/155633.108:ERROR:services\webnn\tflite\sam_runner\sam_encoder_runner.cc:559] [runner] CompiledModel::Create DONE in 10347 ms. IsFullyAccelerated=1
+[0814/155633.108:ERROR:services\webnn\tflite\sam_runner\sam_encoder_runner.cc:136] [compile] LiteRT diagnostics:
+[WebNN][GPU-delegate] All 1260 operations are supported by GPU delegate.
+========[WebNN][delegate_webgpu.cc] 1260 ops on GPU, 0 ops on CPU
+[WebNN][delegate] DelegatePrepare: replacing 1260 ops
+[WebNN][delegate] BuildFinalModel START
+[WebNN][BuildFinalModel] BuildModel START
+[WebNN][BuildFinalModel] BuildModel DONE, running transformations...
+[WebNN][BuildFinalModel] Transformations DONE
+[WebNN][delegate] BuildFinalModel DONE
+[WebNN][delegate] GraphToGpuModel START (1211 nodes)
+[WebNN][delegate] GraphToGpuModel DONE
+[WebNN][delegate] ReplaceNodeSubsetsWithDelegateKernels OK
+
+[0814/155633.118:ERROR:services\webnn\tflite\sam_runner\sam_encoder_runner.cc:576] [runner] input elems=3145728 (ramp i*0.25), output elems=1048576
+========webnn litert SimpleMemoryArena::Commit requesting 0 bytes (0.00 MB), exceeds PartitionAlloc 2GB limit: no
+========webnn litert SimpleMemoryArena::Commit requesting 0 bytes (0.00 MB), exceeds PartitionAlloc 2GB limit: no
+E0000 00:00:1786694193.634049   30000 environment.cc:104] Validation error: [Invalid ComputePipeline (unlabeled)] is invalid due to a previous error.
+ - While encoding [ComputePassEncoder (unlabeled)].SetPipeline([Invalid ComputePipeline (unlabeled)]).
+ - While finishing [CommandEncoder (unlabeled)].
+
+E0000 00:00:1786694193.634228   30000 environment.cc:104] Validation error: [Invalid CommandBuffer] is invalid due to a previous error.
+ - While calling [Queue].Submit([[Invalid CommandBuffer]])
+
+[0814/155633.636:ERROR:services\webnn\tflite\sam_runner\sam_encoder_runner.cc:593] [runner] Run #0 OK in 504 ms
+E0000 00:00:1786694193.678029   30000 environment.cc:104] Validation error: [Invalid ComputePipeline (unlabeled)] is invalid due to a previous error.
+ - While encoding [ComputePassEncoder (unlabeled)].SetPipeline([Invalid ComputePipeline (unlabeled)]).
+ - While finishing [CommandEncoder (unlabeled)].
+
+E0000 00:00:1786694193.678115   30000 environment.cc:104] Validation error: [Invalid CommandBuffer] is invalid due to a previous error.
+ - While calling [Queue].Submit([[Invalid CommandBuffer]])
+
+[0814/155633.678:ERROR:services\webnn\tflite\sam_runner\sam_encoder_runner.cc:593] [runner] Run #1 OK in 41 ms
+[0814/155653.681:ERROR:services\webnn\tflite\sam_runner\sam_encoder_runner.cc:604] [runner] Skipping output stats: Lock(kRead) failed (expected on WARP): ERROR: [..\..\third_party\litert\src\litert\cc\litert_tensor_buffer.h:695]
+I0000 00:00:1786694268.602698   30000 delegate_webgpu.cc:274] Destroyed the WebGPU environment.
+INFO: [accelerator_registry.cc:43] DestroyAccelerator: ptr=00007DB0000A0540, name=CpuAccelerator
+INFO: [accelerator_registry.cc:43] DestroyAccelerator: ptr=00007DB0000A0240, name=GPU WebGPU
+EXIT=0

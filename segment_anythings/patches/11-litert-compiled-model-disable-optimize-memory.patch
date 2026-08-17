@@ -1,0 +1,39 @@
+litert: disable OptimizeMemoryForLargeTensors (documented)
+
+Comments out the automatic >1MiB dynamic allocation calls. Kept as a
+documented toggle while the delegation path is being validated; the
+subgraph-level equivalent lives in subgraph.cc.
+
+diff --git a/litert/runtime/compiled_model.cc b/litert/runtime/compiled_model.cc
+index ef2a585b3..cce9e8f65 100644
+--- a/litert/runtime/compiled_model.cc
++++ b/litert/runtime/compiled_model.cc
+@@ -405,9 +405,11 @@ Expected<void> LiteRtCompiledModelT::InitializeRuntime(
+   // Allocate large tensors (> 1 MiB) dynamically instead of packing them into
+   // the single monolithic arena buffer. For large fp32 activations (e.g. WebNN
+   // SD-turbo attention scores) the arena high-water-mark otherwise exceeds
+-  // PartitionAlloc's ~2 GiB single-allocation cap and crashes in
+-  // SimpleMemoryArena::Commit. This also releases dynamic tensors promptly.
+-  interpreter_options.OptimizeMemoryForLargeTensors(1 << 20);
++  // Move tensors > 1 MiB out of the arena to kTfLiteDynamic allocation.
++  // This keeps the arena below PartitionAlloc's ~2 GiB single-allocation cap.
++  // The delegate sets kTfLiteDelegateFlagsAllowDynamicTensors so that
++  // static-shaped but dynamically-allocated tensors are accepted.
++  // interpreter_options.OptimizeMemoryForLargeTensors(1 << 20);
+   if (jit_compilation_options) {
+     auto opaque_options = litert::OpaqueOptions::WrapCObject(
+         jit_compilation_options->options, litert::OwnHandle::kNo);
+@@ -460,6 +462,13 @@ Expected<void> LiteRtCompiledModelT::InitializeRuntime(
+   }
+   interp_->SetNumThreads(num_threads);
+ 
++  // Convert large tensors (> 1 MiB) from kTfLiteArenaRw to kTfLiteDynamic
++  // BEFORE AllocateTensors, so the arena only holds small tensors.
++  // This prevents PartitionAlloc's ~2 GiB single-allocation OOM.
++  // for (int i = 0; i < interp_->subgraphs_size(); ++i) {
++  //   interp_->subgraph(i)->OptimizeMemoryForLargeTensors(1 << 20);
++  // }
++
+   if (jit_compilation_options) {
+     const auto& bindings = jit_compilation_options->external_tensor_bindings;
+     for (const auto& binding : bindings) {

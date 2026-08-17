@@ -1,0 +1,108 @@
+litert: support 0-runtime-input and 5D RESHAPE in delegate parser
+
+Constant-folds 0-runtime-input reshapes into CONSTANT nodes and emits
+Reshape3DAttributes (BHWDC) for rank-5 reshapes.
+
+diff --git a/ml_drift_delegate/tflite/model_builder.cc b/ml_drift_delegate/tflite/model_builder.cc
+index a749b355c..480c20679 100755
+--- a/ml_drift_delegate/tflite/model_builder.cc
++++ b/ml_drift_delegate/tflite/model_builder.cc
+@@ -4373,29 +4376,92 @@ class ReshapeOperationParser : public TFLiteOperationParser {
+                            const TfLiteRegistration* registration) final {
+     RETURN_IF_ERROR(CheckMaxSupportedOpVersion(registration, 1));
+     // TODO(eignasheva): add shape checking
+-    RETURN_IF_ERROR(tflite::CheckGpuDelegateCompatibility(context, tflite_node,
+-                                                          registration));
++    {
++      auto status = tflite::CheckGpuDelegateCompatibility(context, tflite_node,
++                                                          registration);
++      if (!status.ok()) {
++        ABSL_LOG(INFO) << "[WebNN][RESHAPE-fix] CheckGpuDelegateCompatibility "
++                          "REJECTED: " << status.message();
++        return status;
++      }
++    }
+     RETURN_IF_ERROR(PreCheckReadValue(context, tflite_node, 0));
+     RETURN_IF_ERROR(PreCheckOutputs(context, tflite_node));
+     // Here we may have extra inputs. Other tensors were supposed to
+     // define new shape, but in TFLite these are ignored.
+     // TODO(akulik): check that shapes match?
+ 
++    // ABSL_LOG(INFO) << "[WebNN][RESHAPE-fix] RESHAPE ACCEPTED for delegation";
+     return absl::OkStatus();
+   }
+ 
+   void Parse(const TfLiteNode* tflite_node,
+              const TfLiteRegistration* registration,
+              ::ml_drift::GraphFloat32* graph, ObjectReader* reader) final {
++    const int runtime_inputs = reader->GetNumberOfRuntimeInputs();
++    if (runtime_inputs == 0) {
++      // All inputs are constant. Read the constant data tensor, apply the
++      // output shape (reshape only changes logical dimensions, not data),
++      // and emit a CONSTANT node so the GPU can use the reshaped constant.
++      ::ml_drift::TensorFloat32 attr_tensor;
++      reader->ReadTensor(/*node_input_index=*/0, &attr_tensor,
++                         ReadTensorFlags::kNoExtraBytes);
++      // Update shape to match the output tensor's new shape.
++      const TfLiteTensor* output = reader->GetOutputTensor(0);
++      if (output && output->dims) {
++        ::ml_drift::BHWC new_shape;
++        const int rank = output->dims->size;
++        if (rank == 1) {
++          new_shape = ::ml_drift::BHWC(1, 1, 1, output->dims->data[0]);
++        } else if (rank == 2) {
++          new_shape = ::ml_drift::BHWC(1, 1, output->dims->data[0],
++                                       output->dims->data[1]);
++        } else if (rank == 3) {
++          new_shape = ::ml_drift::BHWC(1, output->dims->data[0],
++                                       output->dims->data[1],
++                                       output->dims->data[2]);
++        } else if (rank == 4) {
++          new_shape = ::ml_drift::BHWC(output->dims->data[0],
++                                       output->dims->data[1],
++                                       output->dims->data[2],
++                                       output->dims->data[3]);
++        } else {
++          // Fallback: keep original shape.
++          new_shape = attr_tensor.shape;
++        }
++        attr_tensor.shape = new_shape;
++      }
++      ::ml_drift::Node* node = graph->NewNode();
++      node->operation.type =
++          ToString(::ml_drift::OperationType::CONSTANT);
++      ::ml_drift::ConstTensorAttributes const_attr;
++      const_attr.tensor = std::move(attr_tensor);
++      node->operation.attributes = std::move(const_attr);
++      reader->AddOutputs(node);
++      return;
++    }
++    // Normal runtime path: at least one runtime input.
+     ::ml_drift::Node* node = graph->NewNode();
+     node->operation.type = ToString(::ml_drift::OperationType::RESHAPE);
+     reader->AddInput(node, 0);
+     reader->AddOutputs(node);
+ 
+-    // New shape comes from output shape.
+-    ::ml_drift::ReshapeAttributes attr;
+-    attr.new_shape = graph->FindOutputs(node->id)[0]->tensor.shape;
+-    node->operation.attributes = attr;
++    // New shape comes from the output tensor. Use the TFLite output dims
++    // directly so we can handle 5D (GraphFloat32::Value only stores BHWC).
++    const TfLiteTensor* output = reader->GetOutputTensor(0);
++    const int rank = output ? output->dims->size : 0;
++    if (rank == 5) {
++      ::ml_drift::Reshape3DAttributes attr;
++      attr.new_shape = ::ml_drift::BHWDC(
++          output->dims->data[0], output->dims->data[1],
++          output->dims->data[2], output->dims->data[3],
++          output->dims->data[4]);
++      node->operation.attributes = attr;
++    } else {
++      ::ml_drift::ReshapeAttributes attr;
++      attr.new_shape = graph->FindOutputs(node->id)[0]->tensor.shape;
++      node->operation.attributes = attr;
++    }
+   }
+ };
+ 

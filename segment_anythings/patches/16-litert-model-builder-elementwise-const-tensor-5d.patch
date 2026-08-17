@@ -1,0 +1,48 @@
+litert: accept constant and >=5D inputs in elementwise parser
+
+Allows elementwise ops whose inputs are constants, and handles >=5D
+constants by registering them as graph inputs instead of folding them
+into BHWC attributes.
+
+diff --git a/ml_drift_delegate/tflite/model_builder.cc b/ml_drift_delegate/tflite/model_builder.cc
+index a749b355c..480c20679 100755
+--- a/ml_drift_delegate/tflite/model_builder.cc
++++ b/ml_drift_delegate/tflite/model_builder.cc
+@@ -2167,10 +2167,6 @@ class ElementwiseOperationParser : public TFLiteOperationParser {
+                                                /*required_runtime_inputs=*/1,
+                                                /*required_const_inputs=*/1,
+                                                /*required_outputs=*/1));
+-      if (!CanParseInputsWithConstTensor(context, tflite_node)) {
+-        return absl::InvalidArgumentError(
+-            "Can't parse inputs with const tensors.");
+-      }
+     } else {
+       return absl::InvalidArgumentError("Incorrect operation type passed");
+     }
+@@ -2493,9 +2489,10 @@ class ElementwiseOperationParser : public TFLiteOperationParser {
+       return false;
+     }
+     if (IsBhwcFloat32Convertible(constant_tensor)) return true;
+-    ABSL_LOG(ERROR) << GetTensorDebugString(constant_tensor)
+-                    << " isn't ::ml_drift::BHWC-convertible.";
+-    return false;
++    // The constant tensor is float32-convertible but too large (>=5D) for the
++    // BHWC attribute. Accept it as a graph-level constant tensor, which the
++    // kernel will read as a regular input.
++    return true;
+   }
+ 
+   // Specialization of TfLiteTensorToTensor<Tensor<Scalar, DataType::FLOAT32>>.
+@@ -2634,6 +2631,12 @@ class ElementwiseOperationParser : public TFLiteOperationParser {
+             ::ml_drift::BHWC(1, tensor.shape.b, tensor.shape.w, tensor.shape.c);
+       }
+       *tensor_or_scalar = std::move(tensor);
++    } else {
++      // Constant tensor is >=5D, cannot fold into a BHWC attribute. Add it as a
++      // regular graph input so the elementwise kernel treats it as a second
++      // runtime tensor (both CreateElementwiseTwoInput and
++      // CreateElementwiseTwoInputWithBroadcast support this).
++      reader->AddInput(node, constant_tensor_index);
+     }
+   }
+ 
