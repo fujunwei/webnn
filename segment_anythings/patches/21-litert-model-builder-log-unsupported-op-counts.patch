@@ -1,0 +1,114 @@
+litert: log per-opcode unsupported-node counts
+
+Accumulates per-node rejection counts by opcode and appends a sorted
+summary to the delegation diagnostics log.
+
+diff --git a/ml_drift_delegate/tflite/model_builder.cc b/ml_drift_delegate/tflite/model_builder.cc
+index a749b355c..480c20679 100755
+--- a/ml_drift_delegate/tflite/model_builder.cc
++++ b/ml_drift_delegate/tflite/model_builder.cc
+@@ -6898,10 +7076,32 @@ TfLiteIntArray* GetOpsToReplaceWithOptions(
+     const absl::flat_hash_set<TfLiteBuiltinOperator>* excluded_ops,
+     int start_node_index, int end_node_index,
+     TFLiteStablehloCompositeParserFactory* composite_parser_factory) {
++  // Per-opcode rejection counters. `unsupported_nodes_info` in
++  // `GraphPartitionHelper::PrepareSupportedNodes` is a `std::set<std::string>`
++  // that deduplicates by "op_name: reason", so the summary log below reports
++  // the number of distinct rejection reasons, not the number of nodes that hit
++  // each reason. These counters accumulate per-node so the log can surface
++  // "which unsupported op should I prioritize supporting" answers.
++  //
++  // `mutable` because `node_supported_fn` is captured by value into an
++  // `std::function` inside `FP16GraphPartitionHelper`; the wrapper's
++  // `operator()` is `const`, so the local map must be marked mutable to
++  // remain writable from within the lambda.
++  absl::flat_hash_map<int32_t, int> unsupported_builtin_counts;
++  absl::flat_hash_map<std::string, int> unsupported_custom_counts;
+   tflite::delegates::IsNodeSupportedFn node_supported_fn =
+-      [=](TfLiteContext* context, TfLiteNode* node,
++      [=, &unsupported_builtin_counts, &unsupported_custom_counts](
++          TfLiteContext* context, TfLiteNode* node,
+           TfLiteRegistration* registration,
+           std::string* unsupported_details) -> bool {
++    auto record_rejection = [&]() {
++      if (registration->builtin_code == kTfLiteBuiltinCustom &&
++          registration->custom_name != nullptr) {
++        ++unsupported_custom_counts[registration->custom_name];
++      } else {
++        ++unsupported_builtin_counts[registration->builtin_code];
++      }
++    };
+     const auto status =
+         CheckIfSupportedNode(context, node, registration, allow_quant_ops,
+                              options, excluded_ops, composite_parser_factory);
+@@ -6909,6 +7109,7 @@ TfLiteIntArray* GetOpsToReplaceWithOptions(
+       if (unsupported_details) {
+         *unsupported_details = std::string(status.message());
+       }
++      record_rejection();
+       return false;
+     }
+ 
+@@ -7016,6 +7217,7 @@ TfLiteIntArray* GetOpsToReplaceWithOptions(
+                              unsupported_details) ||
+         !IsAllAllowedTensors(context, node->outputs, allowed_out_types,
+                              unsupported_details)) {
++      record_rejection();
+       return false;
+     }
+     return true;
+@@ -7052,7 +7254,54 @@ TfLiteIntArray* GetOpsToReplaceWithOptions(
+                       partition_helper.num_total_nodes());
+     }
+     absl::StrAppend(&error_message, " operations will run on the CPU.");
++    // Emit per-opcode rejection counts sorted descending by count so the
++    // biggest opportunities show up first. `unsupported_nodes_info` above lists
++    // *distinct reasons*; these counters list *how many nodes* were rejected
++    // per opcode.
++    if (!unsupported_builtin_counts.empty() ||
++        !unsupported_custom_counts.empty()) {
++      std::vector<std::pair<std::string, int>> sorted_counts;
++      sorted_counts.reserve(unsupported_builtin_counts.size() +
++                            unsupported_custom_counts.size());
++      for (const auto& [code, count] : unsupported_builtin_counts) {
++        sorted_counts.emplace_back(
++            tflite::EnumNameBuiltinOperator(
++                static_cast<::tflite::BuiltinOperator>(code)),
++            count);
++      }
++      for (const auto& [name, count] : unsupported_custom_counts) {
++        sorted_counts.emplace_back(absl::StrCat("CUSTOM(", name, ")"), count);
++      }
++      std::sort(sorted_counts.begin(), sorted_counts.end(),
++                [](const auto& a, const auto& b) {
++                  if (a.second != b.second) return a.second > b.second;
++                  return a.first < b.first;
++                });
++      absl::StrAppend(&error_message,
++                      "\nUnsupported node counts by opcode "
++                      "(nodes rejected before partitioning):\n");
++      for (const auto& [name, count] : sorted_counts) {
++        absl::StrAppend(&error_message, "  ", name, ": ", count, "\n");
++      }
++    }
+     TF_LITE_KERNEL_LOG(context, "%s", error_message.c_str());
++    // Also emit through ABSL_LOG so the summary is visible with
++    // chromium --enable-logging (TF_LITE_KERNEL_LOG routes through
++    // context->ReportError which may be a no-op when no error reporter
++    // is configured).
++    TF_LITE_KERNEL_LOG(context, "[WebNN][GPU-delegate] %s",
++                       error_message.c_str());
++  } else if (ops_to_replace.size() == partition_helper.num_total_nodes()) {
++    TF_LITE_KERNEL_LOG(context,
++                       "[WebNN][GPU-delegate] All %d operations are supported "
++                       "by GPU delegate.",
++                       ops_to_replace.size());
++  } else {
++    TF_LITE_KERNEL_LOG(context,
++                       "[WebNN][GPU-delegate] %d ops on GPU, %d total (no "
++                       "rejection info collected)",
++                       ops_to_replace.size(),
++                       partition_helper.num_total_nodes());
+   }
+   return tflite::ConvertVectorToTfLiteIntArray(ops_to_replace);
+ }

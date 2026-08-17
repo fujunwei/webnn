@@ -1,0 +1,40 @@
+tflite: treat static-shaped dynamic tensors as non-dynamic
+
+HasDynamicTensorImpl now only counts kTfLiteDynamic tensors that have
+unknown (<0) dimensions, ignoring tensors that were merely moved to
+dynamic allocation by OptimizeMemoryForLargeTensors.
+
+diff --git a/tflite/core/subgraph.cc b/tflite/core/subgraph.cc
+index cb2ec7b85..ae00609e5 100644
+--- a/tflite/core/subgraph.cc
++++ b/tflite/core/subgraph.cc
+@@ -115,7 +115,9 @@ void SetForbiddenContextFunction(FunctionType* func) {
+   *func = reinterpret_cast<FunctionType>(ForbiddenContextFunction);
+ }
+ 
+-// Returns true if at least one tensor in the given list is kTfLiteDynamic.
++// Returns true if at least one tensor in the given list has a dynamic shape.
++// Only considers kTfLiteDynamic tensors that actually have unknown dimensions,
++// not those that are merely dynamically allocated via OptimizeMemoryForLargeTensors.
+ template <typename TensorIntArray>
+ bool HasDynamicTensorImpl(const TfLiteContext& context,
+                           const TensorIntArray& int_array,
+@@ -124,6 +126,18 @@ bool HasDynamicTensorImpl(const TfLiteContext& context,
+     if (i == kTfLiteOptionalTensor) continue;
+     const TfLiteTensor& tensor = context.tensors[i];
+     if (tensor.allocation_type == kTfLiteDynamic) {
++      // Skip tensors that are dynamically allocated but have static shapes
++      // (e.g. those converted by OptimizeMemoryForLargeTensors).
++      if (tensor.dims != nullptr) {
++        bool has_dynamic_dim = false;
++        for (int j = 0; j < tensor.dims->size; ++j) {
++          if (tensor.dims->data[j] < 0) {
++            has_dynamic_dim = true;
++            break;
++          }
++        }
++        if (!has_dynamic_dim) continue;
++      }
+       if (dynamic_tensor_index) {
+         *dynamic_tensor_index = i;
+       }

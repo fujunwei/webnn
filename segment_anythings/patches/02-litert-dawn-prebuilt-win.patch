@@ -1,0 +1,101 @@
+litert: load Dawn from the prebuilt webgpu_dawn tree (Windows)
+
+Replaces the upstream http_archive stub with a repository_rule that
+copies the prebuilt dawn include/lib directories and emits BUILD files
+referencing webgpu_dawn.dll / libdawn.so.
+
+diff --git a/third_party/dawn/workspace.bzl b/third_party/dawn/workspace.bzl
+index 4e3cf6481..5df316979 100644
+--- a/third_party/dawn/workspace.bzl
++++ b/third_party/dawn/workspace.bzl
+@@ -1,13 +1,80 @@
+-"""This file is used to load the dawn library."""
++"""Load Dawn from a prebuilt webgpu_dawn.dll / libdawn.so (webnn route-A WebGPU, Windows port).
+ 
+-load("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive")
++Replaces the upstream http_archive stub. Points @dawn at the prebuilt tree
++produced by webgpu-dawn-binaries (CMake on Windows, or build_libdawn.sh on Linux).
++Override via DAWN_PREBUILT_DIR env var.
++Exposes targets:
++  - @dawn//:webgpu_dawn , @dawn//:webgpu_headers
++  - @dawn//dawn:webgpu_dawn , @dawn//dawn:dawn_headers
++"""
++
++# Windows BUILD template — references webgpu_dawn.dll
++_WIN_ROOT_BUILD = """
++cc_import(
++    name = "dawn_import",
++    interface_library = "lib/webgpu_dawn.lib",
++    shared_library = "lib/webgpu_dawn.dll",
++    visibility = ["//visibility:public"],
++)
++
++cc_library(
++    name = "libdawn",
++    hdrs = glob(["include/**/*.h*"]),
++    includes = ["include"],
++    deps = [":dawn_import"],
++    visibility = ["//visibility:public"],
++)
++
++alias(name = "webgpu_dawn",   actual = ":libdawn", visibility = ["//visibility:public"])
++alias(name = "webgpu_headers", actual = ":libdawn", visibility = ["//visibility:public"])
++alias(name = "dawn_headers",   actual = ":libdawn", visibility = ["//visibility:public"])
++"""
++
++# Linux/macOS BUILD template — references libdawn.so / libdawn.dylib
++_POSIX_ROOT_BUILD = """
++cc_library(
++    name = "libdawn",
++    hdrs = glob(["include/**/*.h*"]),
++    includes = ["include"],
++    srcs = glob(["lib/libdawn.*"]),
++    visibility = ["//visibility:public"],
++)
++
++alias(name = "webgpu_dawn",   actual = ":libdawn", visibility = ["//visibility:public"])
++alias(name = "webgpu_headers", actual = ":libdawn", visibility = ["//visibility:public"])
++alias(name = "dawn_headers",   actual = ":libdawn", visibility = ["//visibility:public"])
++"""
++
++_DAWN_PKG_BUILD = """
++alias(name = "webgpu_dawn",  actual = "@dawn//:libdawn", visibility = ["//visibility:public"])
++alias(name = "dawn_headers", actual = "@dawn//:libdawn", visibility = ["//visibility:public"])
++"""
++
++def _prebuilt_dawn_impl(ctx):
++    is_win = ctx.os.name.startswith("windows")
++    default_dir = "C:\\\\Users\\\\junweifu\\\\workspace\\\\webnn\\\\_dawn_prebuilt_win" if is_win else "/tmp/dawn/webgpu-dawn-binaries/out/latest"
++    path = ctx.os.environ.get("DAWN_PREBUILT_DIR", default_dir)
++
++    for d in ["include", "lib"]:
++        ctx.execute(["mkdir", "-p", d] if not is_win else ["cmd", "/c", "mkdir", d], quiet = True)
++        if is_win:
++            # xcopy /E /I /Y /Q: recursive, treat dest as dir, overwrite, quiet
++            src = path.rstrip("\\\\") + "\\\\" + d
++            res = ctx.execute(["cmd", "/c", "xcopy", "/E", "/I", "/Y", "/Q", src, d])
++        else:
++            res = ctx.execute(["bash", "-c", "cp -RL %s/%s/. %s/" % (path, d, d)])
++        if res.return_code != 0:
++            fail("prebuilt_dawn: copy '%s' from '%s' failed: %s" % (d, path, res.stderr))
++
++    build_content = _WIN_ROOT_BUILD if is_win else _POSIX_ROOT_BUILD
++    ctx.file("BUILD", build_content)
++    ctx.file("dawn/BUILD", _DAWN_PKG_BUILD)
++
++prebuilt_dawn = repository_rule(
++    implementation = _prebuilt_dawn_impl,
++    environ = ["DAWN_PREBUILT_DIR"],
++    local = True,
++)
+ 
+ def repo():
+-    http_archive(
+-        name = "dawn",
+-        add_prefix = "dawn",
+-        urls = [
+-            "https://github.com/google/dawn/archive/v20250713.025201.tar.gz",
+-        ],
+-        build_file = "//third_party/dawn:BUILD",
+-    )
++    prebuilt_dawn(name = "dawn")

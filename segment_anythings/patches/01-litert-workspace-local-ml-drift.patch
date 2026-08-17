@@ -1,0 +1,26 @@
+litert: point @ml_drift at the local chromium ml-drift checkout
+
+Swaps the http_archive for a local_repository so Bazel builds use the
+locally modified ml-drift tree at
+C:/Users/junweifu/workspace/chromium/src/third_party/ml-drift.
+
+diff --git a/WORKSPACE b/WORKSPACE
+index 153f46f32..2ccf55600 100644
+--- a/WORKSPACE
++++ b/WORKSPACE
+@@ -365,12 +365,13 @@ load("//third_party/google_tensor:workspace.bzl", "google_tensor")
+ google_tensor()
+ 
+ # ML Drift ----------------------------------------------------------------------------------
+-http_archive(
++# webnn route-A: use local_repository pointing to chromium's ml-drift checkout.
++local_repository(
+     name = "ml_drift",
++    path = "C:/Users/junweifu/workspace/chromium/src/third_party/ml-drift",
+     repo_mapping = {
+         "@fp16": "@FP16",
+     },
+-    strip_prefix = "ml-drift-main",
+ )
+ 
+ # LiteRT GPU ----------------------------------------------------------------------------------

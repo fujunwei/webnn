@@ -1,0 +1,31 @@
+litert: always emit LITERT_LOGGER_LOG_PROD messages
+
+Removes the min-severity gate so PROD logging is emitted even when no
+minimum severity is configured, making delegate diagnostics visible.
+
+diff --git a/litert/c/internal/litert_logging.h b/litert/c/internal/litert_logging.h
+index a71248c5d..87808a640 100644
+--- a/litert/c/internal/litert_logging.h
++++ b/litert/c/internal/litert_logging.h
+@@ -114,17 +114,10 @@ LiteRtStatus LiteRtUseSinkLogger();
+ #define __FILE_NAME__ __FILE__
+ #endif
+ 
+-#define LITERT_LOGGER_LOG_PROD(logger, severity, format, ...)             \
+-  {                                                                       \
+-    LiteRtLogSeverity __min_severity__;                                   \
+-    if (LiteRtGetMinLoggerSeverity(logger, &__min_severity__) !=          \
+-        kLiteRtStatusOk) {                                                \
+-      __min_severity__ = kLiteRtLogSeverityVerbose;                       \
+-    }                                                                     \
+-    if (severity >= __min_severity__) {                                   \
+-      LiteRtLoggerLog(logger, severity, "[%s:%d] " format, __FILE_NAME__, \
+-                      __LINE__, ##__VA_ARGS__);                           \
+-    }                                                                     \
++#define LITERT_LOGGER_LOG_PROD(logger, severity, format, ...)           \
++  {                                                                     \
++    LiteRtLoggerLog(logger, severity, "[%s:%d] " format, __FILE_NAME__, \
++                    __LINE__, ##__VA_ARGS__);                           \
+   }
+ 
+ #ifndef NDEBUG
