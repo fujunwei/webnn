@@ -1,0 +1,255 @@
+litert: add GPU delegate diagnostic logging
+
+Adds TF_LITE_KERNEL_LOG markers and diagnostics throughout the delegate
+initialization and invoke paths so chromium --enable-logging reveals
+what is happening:
+
+- BuildFinalModel / GraphToGpuModel progress in delegate_kernel.cc;
+- buffered error reporter message on invoke failure in compiled_model.cc;
+- per-node GPU/CPU delegation split and ReplaceNodeSubsets result in
+  delegate_webgpu.cc;
+- BuildModel / ApplyGpuModelTransformations progress in model_builder.cc;
+- per-opcode unsupported-node counts in model_builder.cc.
+
+Pure logging; no behavioral change.
+
+Merges former patches 10, 12, 14, 20, 21.
+
+diff --git a/ml_drift_delegate/delegate/delegate_kernel.cc b/ml_drift_delegate/delegate/delegate_kernel.cc
+index 5a5980891..6586efd6c 100644
+--- a/ml_drift_delegate/delegate/delegate_kernel.cc
++++ b/ml_drift_delegate/delegate/delegate_kernel.cc
+@@ -241,12 +241,14 @@ absl::Status DelegateKernel::Initialize(
+   options.enable_reduced_precision = delegate_data_->calculation_precision ==
+                                      ::ml_drift::CalculationsPrecision::F16;
+   // Build GraphFloat32.
++  TF_LITE_KERNEL_LOG(context, "[WebNN][delegate] BuildFinalModel START");
+   ::ml_drift::GraphFloat32 graph;
+   CustomOperationParserFactory custom_parser_factory;
+   ABSL_RETURN_IF_ERROR(BuildFinalModel(
+       context, delegate_params, options, &graph, &quant_conversion_map_,
+       shared_tensors_ptr, tensor_to_buffer_id_map,
+       tensor_to_external_buffer_id_map, &custom_parser_factory));
++  TF_LITE_KERNEL_LOG(context, "[WebNN][delegate] BuildFinalModel DONE");
+ 
+   const TfLiteIntArray* input_tensors = delegate_params->input_tensors;
+   const std::vector<::ml_drift::Value*> inputs =
+@@ -831,6 +833,8 @@ absl::Status DelegateKernel::InitInferenceContextFromGraph(
+   ::ml_drift::CreateGpuModelInfo create_info_main = create_info;
+   ABSL_ASSIGN_OR_RETURN(auto gpu_info, backend_->GetInfo());
+   ::ml_drift::GpuModel gpu_model;
++  TF_LITE_KERNEL_LOG(context, "[WebNN][delegate] GraphToGpuModel START (%zu nodes)",
++                     graph->nodes().size());
+   if (delegate_data_->options->convert_weights_on_gpu &&
+       !delegate_data_->options->enable_constant_tensors_sharing &&
+       ::ml_drift::WeightsManager::IsGpuWeightsPreparationSupported(gpu_info)) {
+@@ -840,6 +844,7 @@ absl::Status DelegateKernel::InitInferenceContextFromGraph(
+     ABSL_RETURN_IF_ERROR(::ml_drift::GraphToGpuModel(
+         *graph, create_info, gpu_info, &gpu_model, &op_selector));
+   }
++  TF_LITE_KERNEL_LOG(context, "[WebNN][delegate] GraphToGpuModel DONE");
+   ABSL_ASSIGN_OR_RETURN(ctx_, backend_->CreateInferenceContext(
+                                   create_info_main, gpu_model, serialized_model,
+                                   /*may_share_memory_manager=*/true));
+diff --git a/litert/runtime/compiled_model.cc b/litert/runtime/compiled_model.cc
+index ef2a585b3..cce9e8f65 100644
+--- a/litert/runtime/compiled_model.cc
++++ b/litert/runtime/compiled_model.cc
+@@ -2003,6 +2012,13 @@ Expected<void> LiteRtCompiledModelT::Run(
+     if (invoke_status == kTfLiteCancelled) {
+       return Unexpected(kLiteRtStatusCancelled, "Execution was cancelled");
+     }
++    // Retrieve buffered error messages (e.g. from the delegate) to help
++    // diagnose the invoke failure.
++    if (auto* buffer_reporter =
++            dynamic_cast<litert::BufferErrorReporter*>(error_reporter_.get())) {
++      LITERT_LOG(LITERT_ERROR, "[webnn-run] invoke error: %s",
++                 buffer_reporter->message().c_str());
++    }
+     return Unexpected(kLiteRtStatusErrorRuntimeFailure, "Failed to invoke");
+   }
+   // Copy data from TfLiteTensor to LiteRtTensorBuffer for pending outputs (e.g.
+diff --git a/ml_drift_delegate/delegate/delegate_webgpu.cc b/ml_drift_delegate/delegate/delegate_webgpu.cc
+index 9578cbb66..fd26fc43e 100644
+--- a/ml_drift_delegate/delegate/delegate_webgpu.cc
++++ b/ml_drift_delegate/delegate/delegate_webgpu.cc
+@@ -509,6 +510,36 @@ TfLiteStatus DelegatePrepare(TfLiteContext* context, TfLiteDelegate* delegate) {
+       context, /*allow_quant_ops=*/true, /*max_delegated_partitions=*/1,
+       &kExcludedOps, start_node_index, end_node_index, &custom_parser_factory);
+ 
++  // Log per-node delegation status so chromium --enable-logging reveals
++  // exactly which ops run on GPU vs CPU.
++  {
++    absl::flat_hash_set<int> delegated_nodes(
++        ops_to_replace->data, ops_to_replace->data + ops_to_replace->size);
++    int gpu_count = 0;
++    int cpu_count = 0;
++    std::string cpu_op_list;
++    for (int i = start_node_index; i < end_node_index; ++i) {
++      TfLiteNode* node = nullptr;
++      TfLiteRegistration* reg = nullptr;
++      if (context->GetNodeAndRegistration(context, i, &node, &reg) !=
++          kTfLiteOk) {
++        continue;
++      }
++      const char* op_name =
++          tflite::EnumNameBuiltinOperator(
++              static_cast<tflite::BuiltinOperator>(reg->builtin_code));
++      if (delegated_nodes.contains(i)) {
++        ++gpu_count;
++      } else {
++        ++cpu_count;
++        absl::StrAppend(&cpu_op_list, "\n  node #", i, ": ", op_name);
++      }
++    }
++    TF_LITE_KERNEL_LOG(
++        context, "========[WebNN][delegate_webgpu.cc] %d ops on GPU, %d ops on CPU%s",
++        gpu_count, cpu_count, cpu_count > 0 ? cpu_op_list.c_str() : "");
++  }
++
+ #if defined(__linux__)
+   if (auto* env_debug_exclude_nodes = std::getenv(kEnvDebugExcludeNodes)) {
+     absl::flat_hash_set<int> excluded_nodes;
+@@ -548,8 +579,12 @@ TfLiteStatus DelegatePrepare(TfLiteContext* context, TfLiteDelegate* delegate) {
+       .registration_external = nullptr,
+       .async_kernel = nullptr,
+   };
++  TF_LITE_KERNEL_LOG(context, "[WebNN][delegate] DelegatePrepare: replacing %d ops",
++                     ops_to_replace->size);
+   const TfLiteStatus status = context->ReplaceNodeSubsetsWithDelegateKernels(
+       context, kRegistration, ops_to_replace, delegate);
++  TF_LITE_KERNEL_LOG(context, "[WebNN][delegate] ReplaceNodeSubsetsWithDelegateKernels %s",
++                     status == kTfLiteOk ? "OK" : "FAILED");
+   TfLiteIntArrayFree(ops_to_replace);
+   return status;
+ }
+diff --git a/ml_drift_delegate/tflite/model_builder.cc b/ml_drift_delegate/tflite/model_builder.cc
+index a749b355c..480c20679 100755
+--- a/ml_drift_delegate/tflite/model_builder.cc
++++ b/ml_drift_delegate/tflite/model_builder.cc
+@@ -6898,10 +7076,32 @@ TfLiteIntArray* GetOpsToReplaceWithOptions(
+     const absl::flat_hash_set<TfLiteBuiltinOperator>* excluded_ops,
+     int start_node_index, int end_node_index,
+     TFLiteStablehloCompositeParserFactory* composite_parser_factory) {
++  // Per-opcode rejection counters. `unsupported_nodes_info` in
++  // `GraphPartitionHelper::PrepareSupportedNodes` is a `std::set<std::string>`
++  // that deduplicates by "op_name: reason", so the summary log below reports
++  // the number of distinct rejection reasons, not the number of nodes that hit
++  // each reason. These counters accumulate per-node so the log can surface
++  // "which unsupported op should I prioritize supporting" answers.
++  //
++  // `mutable` because `node_supported_fn` is captured by value into an
++  // `std::function` inside `FP16GraphPartitionHelper`; the wrapper's
++  // `operator()` is `const`, so the local map must be marked mutable to
++  // remain writable from within the lambda.
++  absl::flat_hash_map<int32_t, int> unsupported_builtin_counts;
++  absl::flat_hash_map<std::string, int> unsupported_custom_counts;
+   tflite::delegates::IsNodeSupportedFn node_supported_fn =
+-      [=](TfLiteContext* context, TfLiteNode* node,
++      [=, &unsupported_builtin_counts, &unsupported_custom_counts](
++          TfLiteContext* context, TfLiteNode* node,
+           TfLiteRegistration* registration,
+           std::string* unsupported_details) -> bool {
++    auto record_rejection = [&]() {
++      if (registration->builtin_code == kTfLiteBuiltinCustom &&
++          registration->custom_name != nullptr) {
++        ++unsupported_custom_counts[registration->custom_name];
++      } else {
++        ++unsupported_builtin_counts[registration->builtin_code];
++      }
++    };
+     const auto status =
+         CheckIfSupportedNode(context, node, registration, allow_quant_ops,
+                              options, excluded_ops, composite_parser_factory);
+@@ -6909,6 +7109,7 @@ TfLiteIntArray* GetOpsToReplaceWithOptions(
+       if (unsupported_details) {
+         *unsupported_details = std::string(status.message());
+       }
++      record_rejection();
+       return false;
+     }
+ 
+@@ -7016,6 +7217,7 @@ TfLiteIntArray* GetOpsToReplaceWithOptions(
+                              unsupported_details) ||
+         !IsAllAllowedTensors(context, node->outputs, allowed_out_types,
+                              unsupported_details)) {
++      record_rejection();
+       return false;
+     }
+     return true;
+@@ -7052,7 +7254,54 @@ TfLiteIntArray* GetOpsToReplaceWithOptions(
+                       partition_helper.num_total_nodes());
+     }
+     absl::StrAppend(&error_message, " operations will run on the CPU.");
++    // Emit per-opcode rejection counts sorted descending by count so the
++    // biggest opportunities show up first. `unsupported_nodes_info` above lists
++    // *distinct reasons*; these counters list *how many nodes* were rejected
++    // per opcode.
++    if (!unsupported_builtin_counts.empty() ||
++        !unsupported_custom_counts.empty()) {
++      std::vector<std::pair<std::string, int>> sorted_counts;
++      sorted_counts.reserve(unsupported_builtin_counts.size() +
++                            unsupported_custom_counts.size());
++      for (const auto& [code, count] : unsupported_builtin_counts) {
++        sorted_counts.emplace_back(
++            tflite::EnumNameBuiltinOperator(
++                static_cast<::tflite::BuiltinOperator>(code)),
++            count);
++      }
++      for (const auto& [name, count] : unsupported_custom_counts) {
++        sorted_counts.emplace_back(absl::StrCat("CUSTOM(", name, ")"), count);
++      }
++      std::sort(sorted_counts.begin(), sorted_counts.end(),
++                [](const auto& a, const auto& b) {
++                  if (a.second != b.second) return a.second > b.second;
++                  return a.first < b.first;
++                });
++      absl::StrAppend(&error_message,
++                      "\nUnsupported node counts by opcode "
++                      "(nodes rejected before partitioning):\n");
++      for (const auto& [name, count] : sorted_counts) {
++        absl::StrAppend(&error_message, "  ", name, ": ", count, "\n");
++      }
++    }
+     TF_LITE_KERNEL_LOG(context, "%s", error_message.c_str());
++    // Also emit through ABSL_LOG so the summary is visible with
++    // chromium --enable-logging (TF_LITE_KERNEL_LOG routes through
++    // context->ReportError which may be a no-op when no error reporter
++    // is configured).
++    TF_LITE_KERNEL_LOG(context, "[WebNN][GPU-delegate] %s",
++                       error_message.c_str());
++  } else if (ops_to_replace.size() == partition_helper.num_total_nodes()) {
++    TF_LITE_KERNEL_LOG(context,
++                       "[WebNN][GPU-delegate] All %d operations are supported "
++                       "by GPU delegate.",
++                       ops_to_replace.size());
++  } else {
++    TF_LITE_KERNEL_LOG(context,
++                       "[WebNN][GPU-delegate] %d ops on GPU, %d total (no "
++                       "rejection info collected)",
++                       ops_to_replace.size(),
++                       partition_helper.num_total_nodes());
+   }
+   return tflite::ConvertVectorToTfLiteIntArray(ops_to_replace);
+ }
+ 
+@@ -7262,12 +7511,18 @@ absl::Status BuildFinalModel(
+     const TensorIndexToBufferIdMap* tensor_to_buffer_id_map,
+     const TensorIndexToExternalBufferIdMap* tensor_to_external_buffer_id_map,
+     TFLiteStablehloCompositeParserFactory* composite_parser_factory) {
++  TF_LITE_KERNEL_LOG(context, "[WebNN][BuildFinalModel] BuildModel START");
+   RETURN_IF_ERROR(
+       BuildModel(context, delegate_params, options, graph, quant_conversion_map,
+                  shared_tensors, tensor_to_buffer_id_map,
+                  tensor_to_external_buffer_id_map, composite_parser_factory));
++  TF_LITE_KERNEL_LOG(context,
++                     "[WebNN][BuildFinalModel] BuildModel DONE, "
++                     "running transformations...");
+ 
+-  return ApplyGpuModelTransformations(graph);
++  auto result = ApplyGpuModelTransformations(graph);
++  TF_LITE_KERNEL_LOG(context, "[WebNN][BuildFinalModel] Transformations DONE");
++  return result;
+ }
+ 
+ namespace {

@@ -1,0 +1,416 @@
+litert: support 0-runtime-input and 5D tensors in the GPU delegate
+
+Allows RESHAPE/TRANSPOSE with 0 runtime inputs (constant data tensors)
+and rank-5 tensors through the GPU delegate:
+
+- relax the GPU-compat check to accept 0 or 1 runtime inputs for
+  RESHAPE/TRANSPOSE (previously exactly 1);
+- accept constant and >=5D inputs in the elementwise parser, registering
+  >=5D constants as graph inputs instead of folding them into BHWC
+  attributes;
+- constant-fold 0-runtime-input RESHAPE/TRANSPOSE into CONSTANT nodes;
+- emit Reshape3DAttributes/Transpose3DAttributes (BHWDC) for rank-5
+  reshape/transpose;
+- allow rank-5 tensors in IsAllAllowedTensors (reject only 6D+).
+
+Merges former patches 09, 16, 17, 18, 19.
+
+diff --git a/tflite/tools/versioning/gpu_compatibility.cc b/tflite/tools/versioning/gpu_compatibility.cc
+index 25ff8337a..96d3c8c95 100644
+--- a/tflite/tools/versioning/gpu_compatibility.cc
++++ b/tflite/tools/versioning/gpu_compatibility.cc
+@@ -21,6 +21,7 @@ limitations under the License.
+ #include <string>
+ #include <vector>
+ 
++#include "absl/log/absl_log.h"
+ #include "absl/status/status.h"
+ #include "absl/strings/str_cat.h"
+ #include "absl/strings/str_format.h"
+@@ -950,11 +951,27 @@ absl::Status CheckGpuDelegateCompatibility(const OpSignature& op_sig,
+     case kTfLiteBuiltinPrelu:
+       return absl::OkStatus();
+ 
+-    case kTfLiteBuiltinReshape:
+-      RETURN_IF_ERROR(CheckInputsOutputs(op_sig,
+-                                         /*required_runtime_inputs=*/1,
+-                                         /*required_outputs=*/1));
++    case kTfLiteBuiltinReshape: {
++      // RESHAPE can have 0 or 1 runtime inputs. 0 runtime inputs means the
++      // data tensor is constant (e.g. output of a folded constant dequantize
++      // or transpose). The GPU delegate handles this fine — it derives the
++      // new shape from the output tensor and ignores the shape input.
++      const int runtime_inputs = GetNumberOfRuntimeInputs(op_sig);
++      if (runtime_inputs < 0 || runtime_inputs > 1) {
++        return absl::InternalError(
++            absl::StrCat("Expected 0 or 1 runtime input tensor(s), but node "
++                         "has ", runtime_inputs, " runtime input(s)."));
++      }
++      if (op_sig.outputs.size() != 1) {
++        return absl::InternalError(
++            absl::StrCat("Expected 1 output tensor(s), but node has ",
++                         op_sig.outputs.size(), " output(s)."));
++      }
++      // ABSL_LOG(INFO) << "[WebNN][gpu_compat] RESHAPE accepted: "
++      //                << runtime_inputs << " runtime inputs, "
++      //                << op_sig.inputs.size() << " total inputs";
+       return absl::OkStatus();
++    }
+     case kTfLiteBuiltinSelect:
+     case kTfLiteBuiltinSelectV2:
+       return CheckSelectV2GpuDelegateCompatibility(op_sig);
+@@ -1045,11 +1062,22 @@ absl::Status CheckGpuDelegateCompatibility(const OpSignature& op_sig,
+                                          /*required_outputs=*/2));
+       return absl::OkStatus();
+ 
+-    case kTfLiteBuiltinTranspose:
+-      RETURN_IF_ERROR(CheckInputsOutputs(op_sig,
+-                                         /*required_runtime_inputs=*/1,
+-                                         /*required_outputs=*/1));
++    case kTfLiteBuiltinTranspose: {
++      // TRANSPOSE can have 0 or 1 runtime inputs. 0 runtime inputs means
++      // the data tensor is constant.
++      const int runtime_inputs = GetNumberOfRuntimeInputs(op_sig);
++      if (runtime_inputs < 0 || runtime_inputs > 1) {
++        return absl::InternalError(
++            absl::StrCat("Expected 0 or 1 runtime input tensor(s), but node "
++                         "has ", runtime_inputs, " runtime input(s)."));
++      }
++      if (op_sig.outputs.size() != 1) {
++        return absl::InternalError(
++            absl::StrCat("Expected 1 output tensor(s), but node has ",
++                         op_sig.outputs.size(), " output(s)."));
++      }
+       return absl::OkStatus();
++    }
+ 
+     case kTfLiteBuiltinTransposeConv: {
+       RETURN_IF_ERROR(CheckConvolutionInputOutput(op_sig));
+diff --git a/ml_drift_delegate/tflite/model_builder.cc b/ml_drift_delegate/tflite/model_builder.cc
+index a749b355c..480c20679 100755
+--- a/ml_drift_delegate/tflite/model_builder.cc
++++ b/ml_drift_delegate/tflite/model_builder.cc
+@@ -2167,10 +2167,6 @@ class ElementwiseOperationParser : public TFLiteOperationParser {
+                                                /*required_runtime_inputs=*/1,
+                                                /*required_const_inputs=*/1,
+                                                /*required_outputs=*/1));
+-      if (!CanParseInputsWithConstTensor(context, tflite_node)) {
+-        return absl::InvalidArgumentError(
+-            "Can't parse inputs with const tensors.");
+-      }
+     } else {
+       return absl::InvalidArgumentError("Incorrect operation type passed");
+     }
+@@ -2493,9 +2489,10 @@ class ElementwiseOperationParser : public TFLiteOperationParser {
+       return false;
+     }
+     if (IsBhwcFloat32Convertible(constant_tensor)) return true;
+-    ABSL_LOG(ERROR) << GetTensorDebugString(constant_tensor)
+-                    << " isn't ::ml_drift::BHWC-convertible.";
+-    return false;
++    // The constant tensor is float32-convertible but too large (>=5D) for the
++    // BHWC attribute. Accept it as a graph-level constant tensor, which the
++    // kernel will read as a regular input.
++    return true;
+   }
+ 
+   // Specialization of TfLiteTensorToTensor<Tensor<Scalar, DataType::FLOAT32>>.
+@@ -2634,6 +2631,12 @@ class ElementwiseOperationParser : public TFLiteOperationParser {
+             ::ml_drift::BHWC(1, tensor.shape.b, tensor.shape.w, tensor.shape.c);
+       }
+       *tensor_or_scalar = std::move(tensor);
++    } else {
++      // Constant tensor is >=5D, cannot fold into a BHWC attribute. Add it as a
++      // regular graph input so the elementwise kernel treats it as a second
++      // runtime tensor (both CreateElementwiseTwoInput and
++      // CreateElementwiseTwoInputWithBroadcast support this).
++      reader->AddInput(node, constant_tensor_index);
+     }
+   }
+ 
+@@ -4373,29 +4376,92 @@ class ReshapeOperationParser : public TFLiteOperationParser {
+                            const TfLiteRegistration* registration) final {
+     RETURN_IF_ERROR(CheckMaxSupportedOpVersion(registration, 1));
+     // TODO(eignasheva): add shape checking
+-    RETURN_IF_ERROR(tflite::CheckGpuDelegateCompatibility(context, tflite_node,
+-                                                          registration));
++    {
++      auto status = tflite::CheckGpuDelegateCompatibility(context, tflite_node,
++                                                          registration);
++      if (!status.ok()) {
++        ABSL_LOG(INFO) << "[WebNN][RESHAPE-fix] CheckGpuDelegateCompatibility "
++                          "REJECTED: " << status.message();
++        return status;
++      }
++    }
+     RETURN_IF_ERROR(PreCheckReadValue(context, tflite_node, 0));
+     RETURN_IF_ERROR(PreCheckOutputs(context, tflite_node));
+     // Here we may have extra inputs. Other tensors were supposed to
+     // define new shape, but in TFLite these are ignored.
+     // TODO(akulik): check that shapes match?
+ 
++    // ABSL_LOG(INFO) << "[WebNN][RESHAPE-fix] RESHAPE ACCEPTED for delegation";
+     return absl::OkStatus();
+   }
+ 
+   void Parse(const TfLiteNode* tflite_node,
+              const TfLiteRegistration* registration,
+              ::ml_drift::GraphFloat32* graph, ObjectReader* reader) final {
++    const int runtime_inputs = reader->GetNumberOfRuntimeInputs();
++    if (runtime_inputs == 0) {
++      // All inputs are constant. Read the constant data tensor, apply the
++      // output shape (reshape only changes logical dimensions, not data),
++      // and emit a CONSTANT node so the GPU can use the reshaped constant.
++      ::ml_drift::TensorFloat32 attr_tensor;
++      reader->ReadTensor(/*node_input_index=*/0, &attr_tensor,
++                         ReadTensorFlags::kNoExtraBytes);
++      // Update shape to match the output tensor's new shape.
++      const TfLiteTensor* output = reader->GetOutputTensor(0);
++      if (output && output->dims) {
++        ::ml_drift::BHWC new_shape;
++        const int rank = output->dims->size;
++        if (rank == 1) {
++          new_shape = ::ml_drift::BHWC(1, 1, 1, output->dims->data[0]);
++        } else if (rank == 2) {
++          new_shape = ::ml_drift::BHWC(1, 1, output->dims->data[0],
++                                       output->dims->data[1]);
++        } else if (rank == 3) {
++          new_shape = ::ml_drift::BHWC(1, output->dims->data[0],
++                                       output->dims->data[1],
++                                       output->dims->data[2]);
++        } else if (rank == 4) {
++          new_shape = ::ml_drift::BHWC(output->dims->data[0],
++                                       output->dims->data[1],
++                                       output->dims->data[2],
++                                       output->dims->data[3]);
++        } else {
++          // Fallback: keep original shape.
++          new_shape = attr_tensor.shape;
++        }
++        attr_tensor.shape = new_shape;
++      }
++      ::ml_drift::Node* node = graph->NewNode();
++      node->operation.type =
++          ToString(::ml_drift::OperationType::CONSTANT);
++      ::ml_drift::ConstTensorAttributes const_attr;
++      const_attr.tensor = std::move(attr_tensor);
++      node->operation.attributes = std::move(const_attr);
++      reader->AddOutputs(node);
++      return;
++    }
++    // Normal runtime path: at least one runtime input.
+     ::ml_drift::Node* node = graph->NewNode();
+     node->operation.type = ToString(::ml_drift::OperationType::RESHAPE);
+     reader->AddInput(node, 0);
+     reader->AddOutputs(node);
+ 
+-    // New shape comes from output shape.
+-    ::ml_drift::ReshapeAttributes attr;
+-    attr.new_shape = graph->FindOutputs(node->id)[0]->tensor.shape;
+-    node->operation.attributes = attr;
++    // New shape comes from the output tensor. Use the TFLite output dims
++    // directly so we can handle 5D (GraphFloat32::Value only stores BHWC).
++    const TfLiteTensor* output = reader->GetOutputTensor(0);
++    const int rank = output ? output->dims->size : 0;
++    if (rank == 5) {
++      ::ml_drift::Reshape3DAttributes attr;
++      attr.new_shape = ::ml_drift::BHWDC(
++          output->dims->data[0], output->dims->data[1],
++          output->dims->data[2], output->dims->data[3],
++          output->dims->data[4]);
++      node->operation.attributes = attr;
++    } else {
++      ::ml_drift::ReshapeAttributes attr;
++      attr.new_shape = graph->FindOutputs(node->id)[0]->tensor.shape;
++      node->operation.attributes = attr;
++    }
+   }
+ };
+ 
+@@ -5586,6 +5652,56 @@ class TransposeConvCustomOperationParser : public TFLiteOperationParser {
+   }
+ };
+ 
++// Transpose constant tensor data according to the given permutation.
++// Only handles 4D (BHWC) tensors. For other ranks the data is passed through.
++void TransposeConstantData(
++    const ::ml_drift::BHWC& src_shape,
++    const std::vector<int32_t>& perm_data,
++    const std::vector<float>& src_data,
++    const ::ml_drift::BHWC& dst_shape,
++    std::vector<float>& dst_data) {
++  const int B = src_shape.b, H = src_shape.h, W = src_shape.w, C = src_shape.c;
++  const int elements = B * H * W * C;
++  if (perm_data.size() != 4 || elements == 0) {
++    dst_data = src_data;
++    return;
++  }
++  // Compute inverse permutation: inv[perm[i]] = i
++  int inv_perm[4];
++  for (int i = 0; i < 4; ++i) inv_perm[perm_data[i]] = i;
++  const int nB = dst_shape.b, nH = dst_shape.h, nW = dst_shape.w,
++            nC = dst_shape.c;
++  dst_data.resize(elements);
++  int src_coords[4];
++  for (int b = 0; b < nB; ++b) {
++    for (int h = 0; h < nH; ++h) {
++      for (int w = 0; w < nW; ++w) {
++        for (int c = 0; c < nC; ++c) {
++          // output_coords = [b, h, w, c]
++          // src_coords[j] = output_coords[inv_perm[j]]
++          src_coords[0] = inv_perm[0] == 0 ? b : inv_perm[0] == 1 ? h
++                                            : inv_perm[0] == 2 ? w
++                                                               : c;
++          src_coords[1] = inv_perm[1] == 0 ? b : inv_perm[1] == 1 ? h
++                                            : inv_perm[1] == 2 ? w
++                                                               : c;
++          src_coords[2] = inv_perm[2] == 0 ? b : inv_perm[2] == 1 ? h
++                                            : inv_perm[2] == 2 ? w
++                                                               : c;
++          src_coords[3] = inv_perm[3] == 0 ? b : inv_perm[3] == 1 ? h
++                                            : inv_perm[3] == 2 ? w
++                                                               : c;
++          const int src_idx = ((src_coords[0] * H + src_coords[1]) * W +
++                               src_coords[2]) * C + src_coords[3];
++          const int dst_idx =
++              ((b * nH + h) * nW + w) * nC + c;
++          dst_data[dst_idx] = src_data[src_idx];
++        }
++      }
++    }
++  }
++}
++
+ class TransposeOperationParser : public TFLiteOperationParser {
+  public:
+   absl::Status IsSupported(const TfLiteContext* context,
+@@ -5600,7 +5716,7 @@ class TransposeOperationParser : public TFLiteOperationParser {
+     ::ml_drift::Tensor<::ml_drift::Linear, ::ml_drift::DataType::INT32> perm;
+     RETURN_IF_ERROR(PreReadTensor(context, tflite_node, 1, &perm,
+                                   ReadTensorFlags::kNoExtraBytes));
+-    if (perm.data.size() > 4 || perm.data.size() < 2) {
++    if (perm.data.size() > 5 || perm.data.size() < 2) {
+       return absl::InvalidArgumentError(
+           "Permutation for transpose is invalid.");
+     }
+@@ -5610,23 +5726,84 @@ class TransposeOperationParser : public TFLiteOperationParser {
+   void Parse(const TfLiteNode* tflite_node,
+              const TfLiteRegistration* registration,
+              ::ml_drift::GraphFloat32* graph, ObjectReader* reader) final {
++    const int runtime_inputs = reader->GetNumberOfRuntimeInputs();
++    ::ml_drift::Tensor<::ml_drift::Linear, ::ml_drift::DataType::INT32> perm;
++    reader->ReadTensor(/*node_input_index=*/1, &perm,
++                       ReadTensorFlags::kNoExtraBytes);
++    if (runtime_inputs == 0) {
++      // All inputs are constant. Read the constant data tensor, apply the
++      // transpose permutation, and emit a CONSTANT node.
++      ::ml_drift::TensorFloat32 attr_tensor;
++      reader->ReadTensor(/*node_input_index=*/0, &attr_tensor,
++                         ReadTensorFlags::kNoExtraBytes);
++      // Transpose the constant data.
++      ::ml_drift::TensorFloat32 transposed;
++      transposed.id = attr_tensor.id;
++      const TfLiteTensor* output = reader->GetOutputTensor(0);
++      if (output && output->dims) {
++        // Compute transposed dimensions.
++        const int rank = output->dims->size;
++        if (rank == 1) {
++          transposed.shape = ::ml_drift::BHWC(1, 1, 1, output->dims->data[0]);
++        } else if (rank == 2) {
++          // Match ExtractTensorShape() convention for 2D tensors so that the
++          // ConstTensorAttributes shape agrees with the graph Value shape
++          // computed by AddOutputs(). Otherwise ReserveGraphTensors() reports:
++          //   "Shape mismatch: {bhwc, {D0, 1, 1, D1}} vs {bhwc, {1, 1, D0, D1}}"
++          // and the delegate falls back to CPU for the whole subgraph (which is
++          // what triggers the ml-drift PartitionAlloc OOM on the SAM encoder).
++          // Physical layout is unchanged: BHWC(D0,1,1,D1) and BHWC(1,1,D0,D1)
++          // both correspond to row-major [D0][D1] on disk.
++          transposed.shape = ::ml_drift::BHWC(output->dims->data[0], 1, 1,
++                                              output->dims->data[1]);
++        } else if (rank == 3) {
++          transposed.shape = ::ml_drift::BHWC(1, output->dims->data[0],
++                                              output->dims->data[1],
++                                              output->dims->data[2]);
++        } else if (rank == 4) {
++          transposed.shape = ::ml_drift::BHWC(output->dims->data[0],
++                                              output->dims->data[1],
++                                              output->dims->data[2],
++                                              output->dims->data[3]);
++        } else {
++          transposed.shape = attr_tensor.shape;
++        }
++      }
++      // Permute the data using the permutation.
++      TransposeConstantData(attr_tensor.shape, perm.data, attr_tensor.data,
++                            transposed.shape, transposed.data);
++      ::ml_drift::Node* node = graph->NewNode();
++      node->operation.type =
++          ToString(::ml_drift::OperationType::CONSTANT);
++      ::ml_drift::ConstTensorAttributes const_attr;
++      const_attr.tensor = std::move(transposed);
++      node->operation.attributes = std::move(const_attr);
++      reader->AddOutputs(node);
++      return;
++    }
++    // Normal runtime path.
+     ::ml_drift::Node* node = graph->NewNode();
+     node->operation.type = ToString(::ml_drift::OperationType::TRANSPOSE);
+     reader->AddInput(node, 0);
+     reader->AddOutputs(node);
+ 
+-    ::ml_drift::TransposeAttributes attr;
+-    ::ml_drift::Tensor<::ml_drift::Linear, ::ml_drift::DataType::INT32> perm;
+-    reader->ReadTensor(1, &perm, ReadTensorFlags::kNoExtraBytes);
+     std::map<::ml_drift::Axis, int> axis_to_index = {
+         {::ml_drift::Axis::BATCH, 0},
+         {::ml_drift::Axis::HEIGHT, 1},
+         {::ml_drift::Axis::WIDTH, 2},
+         {::ml_drift::Axis::CHANNELS, 3}};
+-    if (perm.data.size() == 4) {
++    if (perm.data.size() == 5) {
++      ::ml_drift::Transpose3DAttributes attr;
++      attr.perm = ::ml_drift::BHWDC(perm.data[0], perm.data[1], perm.data[2],
++                                    perm.data[3], perm.data[4]);
++      node->operation.attributes = attr;
++    } else if (perm.data.size() == 4) {
++      ::ml_drift::TransposeAttributes attr;
+       attr.perm = ::ml_drift::BHWC(perm.data[0], perm.data[1], perm.data[2],
+                                    perm.data[3]);
++      node->operation.attributes = attr;
+     } else if (perm.data.size() == 3) {
++      ::ml_drift::TransposeAttributes attr;
+       std::vector<::ml_drift::Axis> index_to_axis = {
+           ::ml_drift::Axis::BATCH, ::ml_drift::Axis::WIDTH,
+           ::ml_drift::Axis::CHANNELS};
+@@ -5634,16 +5811,17 @@ class TransposeOperationParser : public TFLiteOperationParser {
+       attr.perm.h = 1;
+       attr.perm.w = axis_to_index[index_to_axis[perm.data[1]]];
+       attr.perm.c = axis_to_index[index_to_axis[perm.data[2]]];
++      node->operation.attributes = attr;
+     } else if (perm.data.size() == 2) {
++      ::ml_drift::TransposeAttributes attr;
+       std::vector<::ml_drift::Axis> index_to_axis = {
+           ::ml_drift::Axis::BATCH, ::ml_drift::Axis::CHANNELS};
+       attr.perm.b = axis_to_index[index_to_axis[perm.data[0]]];
+       attr.perm.h = 1;
+       attr.perm.w = 2;
+       attr.perm.c = axis_to_index[index_to_axis[perm.data[1]]];
++      node->operation.attributes = attr;
+     }
+-
+-    node->operation.attributes = attr;
+   }
+ };
+ 
+@@ -6499,9 +6677,9 @@ bool IsAllAllowedTensors(TfLiteContext* context,
+     int tensor_idx = tensor_indices->data[i];
+     if (tensor_idx == kTfLiteOptionalTensor) continue;
+     const TfLiteTensor* t = &context->tensors[tensor_idx];
+-    if (t->dims && t->dims->size >= 5) {
++    if (t->dims && t->dims->size > 5) {
+       *unsupported_details +=
+-          "Tensor dimensions must be less than 5. " + std::string(t->name);
++          "Tensor dimensions must be 5 or fewer. " + std::string(t->name);
+       return false;
+     }
+     bool type_supported = false;
