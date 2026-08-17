@@ -1,8 +1,11 @@
-litert: disable OptimizeMemoryForLargeTensors (documented)
+litert: document OptimizeMemoryForLargeTensors toggle
 
-Comments out the automatic >1MiB dynamic allocation calls. Kept as a
-documented toggle while the delegation path is being validated; the
-subgraph-level equivalent lives in subgraph.cc.
+Comments out the automatic >1 MiB dynamic allocation calls in
+compiled_model.cc (kept as a documented toggle while the delegation path
+is being validated) and documents the kTfLiteDelegateFlagsAllowDynamicTensors
+flag that would be needed to re-enable it.
+
+Merges former patches 11, 15.
 
 diff --git a/litert/runtime/compiled_model.cc b/litert/runtime/compiled_model.cc
 index ef2a585b3..cce9e8f65 100644
@@ -37,3 +40,20 @@ index ef2a585b3..cce9e8f65 100644
    if (jit_compilation_options) {
      const auto& bindings = jit_compilation_options->external_tensor_bindings;
      for (const auto& binding : bindings) {
+diff --git a/ml_drift_delegate/delegate/delegate_webgpu.cc b/ml_drift_delegate/delegate/delegate_webgpu.cc
+index 9578cbb66..fd26fc43e 100644
+--- a/ml_drift_delegate/delegate/delegate_webgpu.cc
++++ b/ml_drift_delegate/delegate/delegate_webgpu.cc
+@@ -704,6 +739,12 @@ TfLiteDelegatePtr CreateMlDriftWebGpuDelegate(MlDriftDelegateOptionsPtr options,
+                              LiteRtDeleteMlDriftWebGpuDelegate);
+   delegate->data_ = delegate_data.release();
+   delegate->Prepare = DelegatePrepare;
++  // Allow dynamic-allocation tensors (kTfLiteDynamic from
++  // OptimizeMemoryForLargeTensors). These have static shapes but use
++  // malloc instead of arena allocation, reducing arena memory pressure.
++  // Without this flag, TFLite rejects the delegate when any tensor uses
++  // kTfLiteDynamic allocation.
++  // delegate->flags |= kTfLiteDelegateFlagsAllowDynamicTensors;
+   if (hint_fully_delegated_to_single_delegate) {
+     delegate->flags |= kTfLiteDelegateFlagsHintFullyDelegatedToSingleDelegate;
+   }
