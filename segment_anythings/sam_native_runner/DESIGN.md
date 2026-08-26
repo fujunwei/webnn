@@ -1,11 +1,13 @@
-# SAM Encoder Native Runner — 设计与分析
+# SAM Encoder Native Runner — 设计说明
 
+> 本文档 = **设计原理 + 迭代历史**。构建 / 命令行 / 使用示例见 **[README.md](README.md)**。
+>
 > 目标：做一个使用 **chromium 编译的库 + 机制**（PartitionAlloc、LiteRT runtime、
 > libLiteRtWebGpuAccelerator.dll）构建的独立 native 程序，直接加载
-> `C:\Users\junweifu\workspace\tflite-dump-model\new_segment_anything_encoder.tflite`，
-> 复现 debug 版无法复现的 PartitionAlloc OOM，并大幅加快 debug 迭代速度。
+> `new_segment_anything_encoder.tflite`，复现 debug 版无法复现的 PartitionAlloc OOM，
+> 并大幅加快 debug 迭代速度。
 >
-> **状态：已实现并冒烟通过**。见 §9 "落地记录"。
+> **状态：已实现并冒烟通过**。见 §8 "落地记录"。
 
 ---
 
@@ -97,12 +99,12 @@ webnn/segment_anythings/sam_native_runner/
 namespace {
 
 constexpr char kModelSwitch[] = "model";
-constexpr char kGpuOnlySwitch[] = "gpu-only";
 constexpr char kRunSwitch[] = "run";
 constexpr char kRunsSwitch[] = "runs";
 
 // 复刻 GraphImplLiteRt::GetCompilationOptions 的核心部分。
-::litert::Expected<::litert::Options> MakeOptions(bool gpu_only) {
+// 默认 GPU + CPU fallback（与 WebNN 一致；不再提供 --gpu-only 开关）。
+::litert::Expected<::litert::Options> MakeOptions() {
   auto options = ::litert::Options::Create();
   if (!options) return options.Error();
 
@@ -112,11 +114,9 @@ constexpr char kRunsSwitch[] = "runs";
   gpu_options->SetPrecision(::litert::GpuOptions::Precision::kFp16);
 
 #if BUILDFLAG(BUILD_LITERT_WITH_XNNPACK)
-  if (!gpu_only) {
-    accelerators |= ::litert::HwAccelerators::kCpu;
-    auto cpu_options = options->GetCpuOptions();
-    if (!cpu_options) return cpu_options.Error();
-  }
+  accelerators |= ::litert::HwAccelerators::kCpu;
+  auto cpu_options = options->GetCpuOptions();
+  if (!cpu_options) return cpu_options.Error();
 #endif
   auto set_accelerators = options->SetHardwareAccelerators(accelerators);
   if (!set_accelerators) return set_accelerators.Error();
@@ -147,7 +147,7 @@ int main(int argc, char** argv) {
   const auto* cl = base::CommandLine::ForCurrentProcess();
   if (!cl->HasSwitch(kModelSwitch)) {
     LOG(ERROR) << "Usage: sam_encoder_runner --model=<tflite> "
-                  "[--gpu-only] [--run] [--runs=N]";
+                  "[--run] [--runs=N]";
     return 1;
   }
 
@@ -172,8 +172,7 @@ int main(int argc, char** argv) {
   }
 
   // 3. Compilation options (mirror of GetCompilationOptions).
-  const bool gpu_only = cl->HasSwitch(kGpuOnlySwitch);
-  auto options = MakeOptions(gpu_only);
+  auto options = MakeOptions();
   if (!options) {
     LOG(ERROR) << "Options failed: " << options.Error().Message();
     return 1;
@@ -185,8 +184,7 @@ int main(int argc, char** argv) {
   //    - kTfLiteDelegateFlagsAllowDynamicTensors (delegate_webgpu.cc)
   //    - OptimizeMemoryForLargeTensors explicit call (compiled_model.cc)
   //    - subgraph.cc bytes-from-dims computation
-  LOG(ERROR) << "[runner] CompiledModel::Create START (gpu_only=" << gpu_only
-             << ")";
+  LOG(ERROR) << "[runner] CompiledModel::Create START (mode=gpu+cpu)";
   auto model = ::litert::CompiledModel::Create(
       *env,
       ::litert::BufferRef<uint8_t>(absl::MakeSpan(
@@ -274,62 +272,14 @@ executable("sam_encoder_runner") {
 
 ---
 
-## 5. 构建方法
-
-### 5.1 在现有 Release out 目录增量构建（推荐）
-
-```powershell
-# 用已有的 Release chrome out 目录（其构建参数 use_partition_alloc_as_malloc=true）
-autoninja -C out\Release services/webnn/tflite/sam_runner:sam_encoder_runner
-
-# 运行（libLiteRtWebGpuAccelerator.dll 已在 out\Release\ 下，exe 同目录自动找到）
-out\Release\sam_encoder_runner.exe --model=C:\Users\junweifu\workspace\tflite-dump-model\new_segment_anything_encoder.tflite
-```
-
-- 首次：编译 1 个 .cc + 链接小 exe（litert/base 的 .obj 都已存在）
-- 增量：改 runner 源码只重链小 exe；改 litert/tflite 源码重编对应 .obj + 重链小 exe
-- **不触碰 chrome.dll** ← 关键加速点
-
-### 5.2 三种模式对照
-
-```powershell
-# A. 复现原始 OOM（当前所有修复生效前的行为不可开关；若需要原始行为可
-#    临时注释 compiled_model.cc 的 OptimizeMemoryForLargeTensors 调用）
-out\Release\sam_encoder_runner.exe --model=...tflite
-
-# B. GPU-only（跳过 CPU/XNNPACK delegate，等价 --webnn-tflite-gpu-only）
-out\Release\sam_encoder_runner.exe --model=...tflite --gpu-only
-
-# C. 编译 + 推理
-out\Release\sam_encoder_runner.exe --model=...tflite --gpu-only --run --runs=5
-
-# fp32
-out\Release\sam_encoder_runner.exe --model=C:\Users\junweifu\workspace\tflite-dump-model\new_segment_anything_encoder.tflite --runs=1 --gpu-only --precision=fp32
-```
-
-### 5.3 debug 版带 PartitionAlloc 的变通
-
-若想 debug 符号 + PartitionAlloc 兼得（可选路径）：
-```
-gn args out\DebugPA
-  is_debug = false          # 关键：false 才默认开 use_partition_alloc_as_malloc
-  is_component_build = false
-  symbol_level = 1
-  dcheck_always_on = true   # 保留 debug 检查
-  use_partition_alloc_as_malloc = true
-```
-小 exe + 静态库 debug 符号，链接仍比 chrome.dll 快一个数量级。
-
----
-
-## 6. 与 chrome 路径的差异分析
+## 5. 与 chrome 路径的差异分析
 
 | 环节 | chrome（WebNN demo 页） | runner | 影响 |
 |---|---|---|---|
 | 模型来源 | WebNN GraphBuilderTflite 现生成 | 直接读 .tflite 文件 | 无影响（OOM 在编译期，与建图无关） |
 | weights | 外部 weights file + mmap | 模型内嵌（183 MB flatbuffer） | 无影响（arena 只算非常量张量） |
 | mojo / 线程 | utility process 后台线程 | 主线程同步调用 | 无影响 |
-| Dawn 实例 | GPU 进程提供 | `Environment::Create({})` 空选项，delegate 自建 | 需验证 WebGPU 设备可创建（见 §7 风险 1） |
+| Dawn 实例 | GPU 进程提供 | `Environment::Create({})` 空选项，delegate 自建 | 需验证 WebGPU 设备可创建（见 §6 风险 1） |
 | PartitionAlloc | chrome 进程（release 有） | exe 链接 //base（同构建参数） | ✅ 一致复现 |
 | 日志 | LOG(ERROR) 到 stderr | 同 | ✅ |
 
@@ -340,9 +290,9 @@ gn args out\DebugPA
 
 ---
 
-## 7. 风险与验证清单
+## 6. 风险与验证清单
 
-> 冒烟测试后的实际状态见 §9.3；以下 3 项在 §9.3 已印证/排除。
+> 冒烟测试后的实际状态见 §8.3；以下 3 项在 §8.3 已印证/排除。
 
 1. **WebGPU 设备创建**（最大风险）：chrome 里 Dawn 由 GPU 进程初始化；runner
    是普通进程，delegate 需自建 Dawn instance（ml_drift/webgpu/instance.cc 有
@@ -365,13 +315,13 @@ gn args out\DebugPA
    reporter dump —— 因为都在 litert/tflite 库里。
 
 5. **VS 调试**：直接 `devenv out\Release\sam_encoder_runner.exe` 或配置 VS
-   调试参数 `--model=... --gpu-only`，断点可打在
+   调试参数 `--model=... --run`，断点可打在
    `LiteRtCompiledModelT::Create` / `ModifyGraphWithDelegateImpl` /
    `DelegatePrepare` / `BuildFinalModel` 等任意位置。
 
 ---
 
-## 8. 后续扩展
+## 7. 后续扩展
 
 - `--dump-arena`：编译后 dump `ArenaPlanner` high-water mark
 - `--threshold=N`：动态调 `OptimizeMemoryForLargeTensors` 阈值（需把阈值做成
@@ -384,9 +334,9 @@ gn args out\DebugPA
 
 ---
 
-## 9. 落地记录（2026-08-13）
+## 8. 落地记录（2026-08-13）
 
-### 9.1 实际改动的文件
+### 8.1 实际改动的文件
 
 在 `C:\Users\junweifu\workspace\chromium\src\` 下：
 
@@ -396,7 +346,7 @@ gn args out\DebugPA
 | `services/webnn/tflite/sam_runner/sam_encoder_runner.cc` | 新增；复刻 `GetCompilationOptions` + `CompiledModel::Create` 主路径 |
 | `services/webnn/BUILD.gn` | 在文件末尾追加 `if (webnn_use_litert) { group("sam_runner_tools") { testonly = true; deps = ["tflite/sam_runner:sam_encoder_runner"] } }`，把新 BUILD.gn 挂进 GN 图。若不加，`autoninja` 会报 `unknown target`。 |
 
-### 9.2 与初稿的偏差
+### 8.2 与初稿的偏差
 
 设计文档写好之后编译遇到 3 类问题，实际代码做了以下调整：
 
@@ -434,7 +384,7 @@ gn args out\DebugPA
    runner 只用 `BUILDFLAG(BUILD_LITERT_WITH_XNNPACK)`（来自
    `//third_party/litert:buildflags`）。
 
-### 9.3 冒烟测试结果
+### 8.3 冒烟测试结果
 
 ```powershell
 autoninja -C out\Release services/webnn/tflite/sam_runner:sam_encoder_runner
@@ -445,8 +395,7 @@ autoninja -C out\Release services/webnn/tflite/sam_runner:sam_encoder_runner
 
 ```powershell
 out\Release\sam_encoder_runner.exe `
-  --model=C:\Users\junweifu\workspace\tflite-dump-model\new_segment_anything_encoder.tflite `
-  --gpu-only
+  --model=C:\Users\junweifu\workspace\tflite-dump-model\new_segment_anything_encoder.tflite
 ```
 
 关键日志（按出现顺序节选）：
@@ -458,7 +407,7 @@ INFO: [gpu_registry.cc:109] Dynamically loaded GPU accelerator(libLiteRtWebGpuAc
 INFO: [accelerator_registry.cc:54] RegisterAccelerator: name=GPU WebGPU
 INFO: [accelerator_registry.cc:54] RegisterAccelerator: name=CpuAccelerator
 INFO: [cpu_registry.cc:75] XNNPACK CPU accelerator registered.
-[runner] CompiledModel::Create START (gpu_only=1)
+[runner] CompiledModel::Create START (mode=gpu+cpu)
 [webnn-oom] OptimizeMemoryForLargeTensors: converted=1054 skipped_input=1 skipped_bytes=230 total=1840
 delegate_webgpu.cc:217] Create WebGPU environment (use_low_power=false, enable_host_mapped_pointer=true)
 environment.cc:525] Selected adapter: Microsoft Basic Render Driver, arch=warp, vendor=microsoft, backend=Direct3D 12, adapterType=CPU / Software
@@ -473,7 +422,7 @@ delegate_webgpu.cc:374] Failed to create litert::ml_drift::DelegateKernelLiteRt:
 EXIT=-536870904
 ```
 
-`-536870904` = `0xE0000008` = PartitionAlloc `OOM_CRASH` code。§7 三项风险全部落地验证：
+`-536870904` = `0xE0000008` = PartitionAlloc `OOM_CRASH` code。§6 三项风险全部落地验证：
 
 > 注：PowerShell 状态栏可能把这个负值截断显示为 `Exit Code: 1`，务必用
 > `$LASTEXITCODE` 或 `[Convert]::ToString($LASTEXITCODE, 16)` 确认，否则会被
@@ -485,7 +434,7 @@ EXIT=-536870904
   `ResizeTensorImpl` 连续申请 4 × 0.75 GiB → arena Commit → PartitionAlloc 拒绝
   的路径上，与 chrome release 版行为完全一致）
 
-### 9.4 备注：WebGPU 后端选到 WARP
+### 8.4 备注：WebGPU 后端选到 WARP
 
 日志里 `Selected adapter: Microsoft Basic Render Driver, arch=warp, adapterType=CPU / Software`
 说明 runner 进程没有拿到真正的 GPU adapter（chrome 是走 GPU 进程沙盒专门配置
@@ -493,37 +442,19 @@ EXIT=-536870904
 特化路径的既有问题（analysis.zh.md 已知项之一），**不影响 OOM 复现本身**。若要在
 runner 里选真 GPU adapter，需要在 `Environment::Create` 时通过
 `LiteRtEnvironmentOption`（如 `kLiteRtEnvOptionTagWebGpuInstance` 等）注入
-预建的 Dawn instance/adapter/device，见 §8 的后续扩展。
-
-### 9.5 快速使用手册（TL;DR）
-
-```powershell
-cd C:\Users\junweifu\workspace\chromium\src
-
-# 构建（首次几十秒；改 runner .cc 后秒级）
-autoninja -C out\Release services/webnn/tflite/sam_runner:sam_encoder_runner
-
-# 复现 OOM
-out\Release\sam_encoder_runner.exe `
-  --model=C:\Users\junweifu\workspace\tflite-dump-model\new_segment_anything_encoder.tflite `
-  --gpu-only
-
-# 编译 + 推理（本机 WARP 下 Run 会失败，等注入真 GPU 后再用）
-out\Release\sam_encoder_runner.exe `
-  --model=<...>.tflite --gpu-only --run --runs=5
-```
+注入预建的 Dawn instance/adapter/device，见 §7 的后续扩展。
 
 ---
 
-## 10. 全 GPU 加速修复（2026-08-13，同日）
+## 9. 全 GPU 加速修复（2026-08-13，同日）
 
 用 §9 的 runner 冒烟通过 OOM 复现后，用户目标转为：**让 SAM 编码器的所有算子
 都下沉到 ml_drift WebGPU delegate**。若成功，CPU 侧 tflite arena 就不再需要
 巨型分配 → OOM 天然消失。
 
-### 10.1 症状
+### 9.1 症状
 
-`--gpu-only` 运行时 delegate 打印：
+默认（GPU + CPU）运行时 delegate 打印：
 
 ```
 Shape mismatch: {bhwc, {2304, 1, 1, 768}} vs {bhwc, {1, 1, 2304, 768}}
@@ -539,7 +470,7 @@ Shape mismatch: {bhwc, {2304, 1, 1, 768}} vs {bhwc, {1, 1, 2304, 768}}
 任一侧不匹配都会导致 `absl::InvalidArgumentError`，进而整个子图被 delegate
 拒绝并回落 CPU。
 
-### 10.2 诊断补丁
+### 9.2 诊断补丁
 
 在 `ReserveGraphTensors` 处理 CONSTANT 分支时先把 `desc` / `data` / 下游
 consumers 全打出来（临时补丁；已在最终修复后回滚）：
@@ -553,7 +484,7 @@ consumers 全打出来（临时补丁；已在最终修复后回滚）：
 `fully_connected#13` 就是 SAM 编码器 QKV 投影入口 —— 常见 HF ViT 导出模式
 `transpose(weight_const) → fully_connected`。
 
-### 10.3 定位
+### 9.3 定位
 
 grep `attr.tensor|OperationType::CONSTANT` 命中的所有 CONSTANT 发射点里，只有
 一处对 rank==2 输出写了 `BHWC(1, 1, D0, D1)`：
@@ -572,7 +503,7 @@ rank 1/3/4 均与 `ExtractTensorShape` 语义一致（前排补 1），只有 ra
 （后排补 1 → 前排补 1）。而 `AddOutputs` 给该节点的 Value 走的正是
 `ExtractTensorShape`，于是两侧永远错位。
 
-### 10.4 修复
+### 9.4 修复
 
 统一到 `ExtractTensorShape` 约定：
 
@@ -585,7 +516,7 @@ rank 1/3/4 均与 `ExtractTensorShape` 语义一致（前排补 1），只有 ra
 }
 ```
 
-### 10.5 验证
+### 9.5 验证
 
 ```powershell
 # 重编并部署 DLL
@@ -594,7 +525,7 @@ route-a-webgpu-windows\scripts\deploy_to_chrome.ps1 -Mode opt `
   -ChromeOutDir C:\Users\junweifu\workspace\chromium\src\out\Release
 
 # 跑 runner
-sam_encoder_runner.exe --model=<...>.tflite --gpu-only
+sam_encoder_runner.exe --model=<...>.tflite
 ```
 
 结果：
@@ -602,12 +533,12 @@ sam_encoder_runner.exe --model=<...>.tflite --gpu-only
 - `IsFullyAccelerated=1`
 - `[WebNN][GPU-delegate] All 1260 operations are supported by GPU delegate.`
 - `1260 ops on GPU, 0 ops on CPU`
-- 退出码 `0`（此前 `--gpu-only` 走的是 PartitionAlloc OOM `0xE0000008`）
+- 退出码 `0`（此前该模型走的是 PartitionAlloc OOM `0xE0000008`）
 
 修复前 delegate 拒收 → 回落 CPU → tflite arena 巨型分配 → OOM。
 修复后子图完整落到 WebGPU，CPU arena 只保留少量小张量，OOM 自然消失。
 
-### 10.6 遗留告警
+### 9.6 遗留告警
 
 以下告警在修复后仍存在，与本次问题无关：
 
@@ -618,14 +549,14 @@ sam_encoder_runner.exe --model=<...>.tflite --gpu-only
 
 ---
 
-## 11. 通用模型验证：`--verify` GPU/CPU 双跑对比（设计，2026-08-14）
+## 10. 通用模型验证：`--verify` GPU/CPU 双跑对比（设计，2026-08-14）
 
 > 目标：让 runner 支持任意模型（当前动机是
 > `C:\Users\junweifu\workspace\tflite-dump-model\ml_drfit_add.tflite`，
 > 注意文件名拼写是 `ml_drfit`），在本机验证 ml_drift WebGPU delegate
-> 输出结果是否正确。落地记录见 §12。
+> 输出结果是否正确。落地记录见 §11。
 
-### 11.1 目标模型
+### 10.1 目标模型
 
 `ml_drfit_add.tflite`（488 字节）：
 
@@ -634,7 +565,7 @@ sam_encoder_runner.exe --model=<...>.tflite --gpu-only
 - 输出 `y`：`[2,2]` float32（name=`y`）
 - 算子：`ADD`（builtin code 0），即 `y = a + const`
 
-### 11.2 改动 1：形状动态化（改现有 `--run` 路径）
+### 10.2 改动 1：形状动态化（改现有 `--run` 路径）
 
 - 删除硬编码的 SAM 形状（`1x3x1024x1024` / `1x256x64x64`），改为从
   `CreateInputBuffers()` / `CreateOutputBuffers()` 返回的
@@ -644,11 +575,11 @@ sam_encoder_runner.exe --model=<...>.tflite --gpu-only
   diff 更有意义；对 SAM 的 `--run` 行为有变化，但该模式本来只打印统计量）。
 - 输出统计块用动态 elems；**输出 ≤ 64 个元素时全量打印所有值**。
 
-### 11.3 改动 2：新增 `--verify` GPU/CPU 双跑对比
+### 10.3 改动 2：新增 `--verify` GPU/CPU 双跑对比
 
 - 同一 Environment 下创建两个 `CompiledModel`：
-  - **GPU 侧**：`MakeOptions(gpu_only=true, precision=--precision, 默认 fp16)`
-    ——与现有 `--gpu-only` 路径完全一致；
+  - **GPU 侧**：`MakeOptions(kGpuOnly, precision=--precision, 默认 fp16)`
+    ——只启用 GPU 加速的编译路径；
   - **CPU 参考侧**：新增 `cpu-only` 分支（accelerators 只含 `kCpu` →
     XNNPACK，**固定 fp32 作 ground truth**）。`BUILD_LITERT_WITH_XNNPACK=0`
     时 `--verify` 直接报错退出。
@@ -661,28 +592,28 @@ sam_encoder_runner.exe --model=<...>.tflite --gpu-only
 - 退出码约定：PASS=0，FAIL=2，其他错误=1，
   GPU 读回失败（无法判定）=3。
 
-### 11.4 WARP 风险
+### 10.4 WARP 风险
 
-本机 GPU 选到 WARP 软件适配器；§9.4 记录过 WARP 上输出 `Lock(kRead)`
+本机 GPU 选到 WARP 软件适配器；§8.4 记录过 WARP 上输出 `Lock(kRead)`
 回读不可靠（SAM 时 hang ~20s 后报错）。2x2 小张量未必触发，但若
 `--verify` 的 GPU 侧读回失败：打印明确提示
 （"GPU readback failed (WARP) — CPU 侧结果仍有效"），退出码 3，不算 FAIL。
 CPU-only 参考侧不受影响（XNNPACK 支持 ADD）。
 
-### 11.5 用法
+### 10.5 用法
 
 ```powershell
 # add 模型验证（GPU fp16 vs CPU fp32）
 out\Release\sam_encoder_runner.exe --model=C:\Users\junweifu\workspace\tflite-dump-model\ml_drfit_add.tflite --verify
 
-# add 模型只跑 GPU（验证形状动态化）
-out\Release\sam_encoder_runner.exe --model=C:\...\ml_drfit_add.tflite --gpu-only --run
+# add 模型跑一次（验证形状动态化）
+out\Release\sam_encoder_runner.exe --model=C:\...\ml_drfit_add.tflite --run
 
 # SAM 照旧
-out\Release\sam_encoder_runner.exe --model=C:\...\new_segment_anything_encoder.tflite --gpu-only
+out\Release\sam_encoder_runner.exe --model=C:\...\new_segment_anything_encoder.tflite
 ```
 
-### 11.6 改动文件与验证计划
+### 10.6 改动文件与验证计划
 
 - 唯一源码改动：`services/webnn/tflite/sam_runner/sam_encoder_runner.cc`；
   `BUILD.gn` 不动。
@@ -691,14 +622,14 @@ out\Release\sam_encoder_runner.exe --model=C:\...\new_segment_anything_encoder.t
   2. `--verify` 跑 `ml_drfit_add.tflite`：CPU 侧应输出
      `ramp + [[1,2],[3,4]]` ≈ `[1.0, 2.25, 3.5, 4.75]`，GPU 侧对比；
      WARP 读回失败则验证退出码 3 路径；
-  3. `--gpu-only --run` 跑 add 模型：确认动态形状生效；
-  4. SAM 模型 `--gpu-only`（不带 `--run`）冒烟：确认无回归。
+  3. `--run` 跑 add 模型：确认动态形状生效；
+  4. SAM 模型（不带 `--run`）冒烟：确认无回归。
 
 ---
 
-## 12. 通用模型验证落地记录（2026-08-14）
+## 11. 通用模型验证落地记录（2026-08-14）
 
-### 12.1 实际改动
+### 11.1 实际改动
 
 - `services/webnn/tflite/sam_runner/sam_encoder_runner.cc`（chromium 主树，
   分支 `integrate_litert_ml_drfit`）：
@@ -710,9 +641,9 @@ out\Release\sam_encoder_runner.exe --model=C:\...\new_segment_anything_encoder.t
     退出码 0=PASS / 1=错误 / 2=FAIL / 3=GPU 读回失败；
   - `--tolerance=N`（默认 1e-2），文件头注释与运行时 Usage 同步更新。
 
-### 12.2 验证结果
+### 11.2 验证结果
 
-add 模型动态形状（`--gpu-only --run`）：
+add 模型动态形状（`--run`）：
 
 ```
 [runner] CompiledModel::Create DONE in 6237 ms. IsFullyAccelerated=1
@@ -742,13 +673,13 @@ EXIT=2
 - tolerance 与退出码映射抽查：`--tolerance=3` → PASS/退出码 0；
   `--tolerance=1e-9` → FAIL/退出码 2。退出码与 `over_tol` 计数一致。
 - 退出码 3 路径本机未触发：add 模型（4 元素）WARP 读回**成功**；
-  SAM 模型（1M 元素）读回仍失败（§9.4 所述），但那是 `--run` 的
+  SAM 模型（1M 元素）读回仍失败（§8.4 所述），但那是 `--run` 的
   skip 路径（退出码 0），非 `--verify` 的 3。
 
 SAM 回归（最终 exe）：
 
 ```
-# --gpu-only --run --runs=2
+# --run --runs=2
 [runner] CompiledModel::Create DONE in 10347 ms. IsFullyAccelerated=1
 [WebNN][GPU-delegate] All 1260 operations are supported by GPU delegate.
 [runner] input elems=3145728 (ramp i*0.25), output elems=1048576
@@ -757,12 +688,12 @@ SAM 回归（最终 exe）：
 [runner] Skipping output stats: Lock(kRead) failed (expected on WARP)   ← 预期
 EXIT=0
 
-# --gpu-only（Task 4 冒烟）
+# （Task 4 冒烟）
 IsFullyAccelerated=1 / All 1260 operations are supported by GPU delegate.
 EXIT=0
 ```
 
-### 12.3 偏差与备注
+### 11.3 偏差与备注
 
 1. **RunVerify 失败分支去掉 `LogErrors(*model, ...)`**：`litert::Expected`
    的 `operator*` → `CheckVal()` → `LITERT_INTERNAL_CHECK` → `std::abort()`
@@ -778,5 +709,154 @@ EXIT=0
 4. 文件头 usage 注释同步更新（计划只提了运行时 Usage 字符串）。
 5. 本机结论：**WARP 上 GPU delegate 对 ml_drfit_add.tflite 输出错误**
    （元素 3、4 错），`--verify` 成功将其精确定位。
+
+---
+
+## 12. 输出 dump 与外部输入（2026-08-21）
+
+> 动机：`--verify` 只打印聚合统计（max/mean/over_tol），≤64 元素才全量打印，
+> SAM encoder 输出 1M 元素无法定位「具体哪些元素错」；且 `--verify` 输入是
+> ramp，不是真实图像。新增 `--dump-outputs` 导出完整输出、`--input` 从文件
+> 读同一份输入。
+
+### 12.1 改动（`sam_encoder_runner.cc`）
+
+- `--dump-outputs=<path prefix>`：把完整输出按 little-endian f32 写文件。
+  - `--verify`：写 `<prefix>_cpu.bin`（CPU 参考）和 `<prefix>_gpu.bin`；
+  - `--run`：写 `<prefix>_run.bin`；
+  - 即使 GPU 读回失败（WARP，退出码 3），CPU 侧也会先 dump。
+- `--input=<f32 bin>`：从文件读输入（替代 ramp），文件大小必须精确等于
+  `input_elems * 4` 字节，否则报错退出；`--verify` 与 `--run` 都支持。
+- 实现备注：Chromium `base::as_bytes` / `base::as_byte_span` 明确禁止对
+  `float` 做字节重解释（`CanSafelyConvertToByteSpan` 约束），dump 用
+  `std::string_view` + `base::WriteFile(string_view)` 绕过；input 读用
+  `base::ReadFileToString` + `UNSAFE_BUFFERS(memcpy)`。
+
+### 12.2 用法
+
+```powershell
+# GPU vs CPU 对比 + 完整输出 dump（默认 ramp 输入）
+out\Release\sam_encoder_runner.exe --model=<tflite> --verify `
+  --dump-outputs=C:\...\sam_enc
+
+# 用外部输入（同一张图的预处理结果）+ dump 输出离线 diff
+out\Release\sam_encoder_runner.exe --model=<tflite> --verify `
+  --input=C:\...\sam_enc_input.bin --dump-outputs=C:\...\sam_enc
+
+# 单跑一次并 dump 输出
+out\Release\sam_encoder_runner.exe --model=<tflite> --run `
+  --input=C:\...\sam_enc_input.bin --dump-outputs=C:\...\sam_enc_run
+```
+
+输入文件生成（Python，row-major 与模型输入张量一致）：
+
+```python
+import numpy as np
+x = preprocessed.astype(np.float32)   # SAM encoder: (1,3,1024,1024) NCHW
+x.tofile(r'C:\...\sam_enc_input.bin')
+```
+
+### 12.3 冒烟验证
+
+add 模型 `--verify --input=[10,20,30,40]`：
+
+```
+[verify] input elems=4 (from ...add_input.bin)     ← 确认从文件读
+[verify-cpu] output values=[11,22,33,44]           ← 10..40 + [[1,2],[3,4]] ✓
+[verify-gpu] output values=[11,22,31,42]           ← 已知 const 广播 bug
+[verify] FAIL  EXIT=2
+```
+
+确认：输入确实来自文件；dump 的 `_cpu.bin` / `_gpu.bin` 内容与日志一致
+（各 4 个 f32、16 字节）。
+
+### 12.4 离线 diff（numpy）
+
+```python
+import numpy as np
+cpu = np.fromfile(r'C:\...\sam_enc_cpu.bin', dtype=np.float32)
+gpu = np.fromfile(r'C:\...\sam_enc_gpu.bin', dtype=np.float32)
+d = np.abs(gpu - cpu)
+print('elems', cpu.size, 'max_abs', d.max(), 'mean_abs', d.mean())
+idx = np.argwhere(d > 1e-2).ravel()
+print('over_tol', idx.size, 'first_bad', idx[:20])
+
+d4 = d.reshape(256, 64, 64)   # SAM encoder 输出 1x256x64x64，按通道定位
+per_ch = d4.mean(axis=(1, 2))
+print('worst channels', np.argsort(per_ch)[::-1][:10])
+```
+
+### 12.5 待办
+
+- **真 GPU adapter 注入**（`kLiteRtEnvOptionTagWebGpuInstance`）：runner 目前
+  默认选 WARP 软件适配器，SAM 的 1M 元素 GPU 输出 `Lock(kRead)` 失败
+  （`--verify` 退出码 3），需注入 Dawn instance/adapter/device 才能在本机
+  跑通 `--verify` 的 GPU 侧（见 §8.4）。
+
+---
+
+## 13. MobileNet CPU/GPU 验证（2026-08-21）
+
+> 目标：用 §12 的 `--input` + `--dump-outputs` 验证 `mobilenet.tflite` 在
+> GPU(ml-drift WebGPU) 与 CPU(XNNPACK) 上推演结果是否一致，输入 `tiger.jpg`。
+
+### 13.1 模型与输入
+
+- `mobilenet.tflite`（7,000,152 字节）**float32 无量化**：
+  - 输入 `pixel_values` `[1,3,224,224]` NCHW
+  - 输出 `logits` `[1,1001]`（ImageNet 1000 类 + background）
+- 无 tensorflow/tflite 环境，用自写 flatbuffer 解析器
+  `sam_native_runner/inspect_tflite.py` 读出输入/输出形状与类型
+  （注：flatbuffer 里 type=buffer=quant 字段缺省即默认值 0 = FLOAT32）。
+
+预处理（新增 `sam_native_runner/prepare_mobilenet_input.ps1`）：
+
+```powershell
+# System.Drawing 解码 tiger.jpg → 拉伸 224×224(bicubic) → 224×224×3 BGR 原始字节
+& ...\prepare_mobilenet_input.ps1
+```
+
+```python
+# BGR→RGB → (x/127.5-1) → NCHW f32
+import numpy as np
+raw = np.fromfile(r'...\tiger_224_bgr.bin', dtype=np.uint8).reshape(224, 224, 3)
+x = ((raw[:, :, ::-1].astype(np.float32) / 127.5) - 1.0).transpose(2, 0, 1)[None]
+x.tofile(r'...\tiger_input.bin')
+```
+
+### 13.2 结果
+
+176 个算子全部落到 GPU delegate（`IsFullyAccelerated=1`）。
+
+| 模式 | max_abs | mean_abs | argmax | top5 | 结论 |
+|---|---|---|---|---|---|
+| GPU fp32 vs CPU fp32 | 0.00141 | 0.00032 | 293 / 293 ✓ | 完全一致 | **PASS** |
+| GPU fp16 vs CPU fp32 | 0.0476 | 0.0085 | 293 / 293 ✓ | 完全一致 | fp16 舍入，非 bug |
+
+- fp32：GPU 与 CPU 只有 ~1e-3 浮点累加顺序差，逐元素 tolerance 1e-2 下 PASS。
+- fp16（Chrome 默认）：logits 有 ~0.05 舍入差（fp16 约 3 位有效数字），
+  默认 `--tolerance=1e-2` 判 FAIL，但 **top-1 / top-5 完全相同**。
+- argmax=293 = ImageNet 292 + background 偏移 → **tiger / Panthera tigris**，
+  分类正确。
+
+### 13.3 复现命令
+
+```powershell
+& C:\Users\junweifu\workspace\webnn\segment_anythings\sam_native_runner\prepare_mobilenet_input.ps1
+
+out\Release\sam_encoder_runner.exe `
+  --model=C:\Users\junweifu\workspace\tflite-dump-model\mobilenet.tflite `
+  --verify --precision=fp32 `
+  --input=C:\Users\junweifu\workspace\tflite-dump-model\tiger_input.bin `
+  --dump-outputs=C:\Users\junweifu\workspace\tflite-dump-model\mobilenet_dump_fp32
+
+# 看 argmax / top5 / 误差
+C:/Python314/python.exe -c "import numpy as np; base=r'C:\Users\junweifu\workspace\tflite-dump-model'; cpu=np.fromfile(base+r'\mobilenet_dump_fp32_cpu.bin',dtype=np.float32); gpu=np.fromfile(base+r'\mobilenet_dump_fp32_gpu.bin',dtype=np.float32); print(int(cpu.argmax()), int(gpu.argmax()), np.argsort(gpu)[::-1][:5], float(np.abs(gpu-cpu).max()))"
+```
+
+### 13.4 结论
+
+ml-drift WebGPU delegate 对 `mobilenet.tflite` 数值正确：fp32 下与 XNNPACK
+CPU 参考几乎一致（~1e-3），分类结果完全一致；fp16 下分类结论也不变。
 
 

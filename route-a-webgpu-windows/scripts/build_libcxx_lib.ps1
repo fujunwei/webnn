@@ -26,11 +26,13 @@ if (-not (Test-Path $OBJDIR)) { throw "libc++ .obj dir not found at $OBJDIR (bui
 
 New-Item -ItemType Directory -Force -Path $Dest | Out-Null
 
-# Write response file with all .obj paths (avoids Windows command-line length limit)
+# Write response file with all .obj paths (avoids Windows command-line length limit).
+# Each path on its own line: Out-File -NoNewline would concatenate without a
+# separator, which lld-link mis-parses (last entry becomes a relative path).
 $rsp  = Join-Path $Dest "objs.rsp"
 $objs = Get-ChildItem "$OBJDIR\*.obj" | ForEach-Object { '"' + $_.FullName + '"' }
 if ($objs.Count -eq 0) { throw "No .obj files in $OBJDIR" }
-$objs | Out-File -FilePath $rsp -Encoding ASCII -NoNewline
+($objs -join "`r`n") | Set-Content -Path $rsp -Encoding ASCII
 
 $out = Join-Path $Dest "libc++.lib"
 & $LLD /lib /NOLOGO "/OUT:$out" "@$rsp"

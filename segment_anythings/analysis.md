@@ -363,3 +363,70 @@ without changing delegate semantics.
   `"only supports static-sized tensors (tensor#N …)"` — that identifies
   which large tensor still needs to be kept in arena (or in a supported
   op).
+
+---
+
+# Delegation logging — seeing which ops run on GPU vs CPU
+
+## Changes made
+
+Three files were modified to add operator-level delegation logging visible via
+chromium `--enable-logging`:
+
+### 1. `third_party/litert/src/ml_drift_delegate/tflite/model_builder.cc`
+
+Added `ABSL_LOG(INFO)` alongside the existing `TF_LITE_KERNEL_LOG` in
+`GetOpsToReplaceWithOptions`. The TFLite error reporter defaults to no-op,
+so `TF_LITE_KERNEL_LOG` was silent. `ABSL_LOG(INFO)` routes through absl →
+chromium's LOG system and is visible with `--enable-logging`.
+
+Output includes:
+- Per-op rejection reasons (deduplicated)
+- "N operations on GPU, M on CPU"
+- Per-opcode unsupported node counts (sorted by count descending)
+
+### 2. `third_party/litert/src/ml_drift_delegate/delegate/delegate_webgpu.cc`
+
+Added a cross-platform loop in `DelegatePrepare` that iterates the execution
+plan and logs every node's delegation status with its op name:
+
+```
+[WebNN][GPU-delegate] <N> ops on GPU, <M> ops on CPU
+  node #3: DEQUANTIZE
+  node #7: RESHAPE
+  ...
+```
+
+CPU fallback ops are explicitly listed with node index and op name.
+
+### 3. `services/webnn/tflite/graph_impl_litert.cc`
+
+Two additions:
+- `LOG(ERROR)` after `CompiledModel::Create` showing `IsFullyAccelerated` status
+- Re-enabled OOM diagnostics block (was commented out): per-tensor byte breakdown,
+  process memory info, and crash keys before the arena-allocating call
+
+## How to use
+
+```
+chromium --enable-logging=stderr --v=1
+```
+
+Then load a model through WebNN. Look for log lines with these prefixes:
+- `[WebNN][GPU-delegate]` — per-node delegation info
+- `[WebNN][OOM-diag]` — tensor sizes, process memory before arena allocation
+- `[WebNN] CompiledModel created. IsFullyAccelerated=...` — top-level status
+
+## About DEQUANTIZE
+
+DEQUANTIZE (`kTfLiteBuiltinDequantize`) is on the supported list when
+`allow_quant_ops=true` (which it is for WebGPU). It gets converted to
+`QUANTIZE_AND_DEQUANTIZE` in the ml-drift IR and handled by the GPU
+operation selector. It can be rejected if:
+- Version > 3
+- Input has per-channel quantization (scale size > 1)
+- Input has no quantization params
+- Constant input with rank < 2 or > 4
+
+If DEQUANTIZE appears in `[WebNN][GPU-delegate] CPU node #N: DEQUANTIZE`,
+check the unsupported summary for the specific rejection reason.

@@ -605,3 +605,194 @@ TRANSPOSE: 76 (-12)
   已是 mmap const" 的旁路，工作量更大。
 - **精度**：`(v - zp) * scale` 在 fp32 里算，量化和 fp16 场景语义等价，
   没有额外的舍入误差引入。
+
+---
+
+# 迭代 3：全部算子 GPU 支持 + OOM 根因（当前）
+
+## 3.1 算子支持修复
+
+针对迭代 2 之后仍被拒的算子，在 ml-drift / LiteRT delegate 里逐一放行：
+
+### 3.1.1 RESHAPE 0 runtime 输入
+
+`gpu_compatibility.cc` 的 `kTfLiteBuiltinReshape` 分支原来要求恰好 1 个
+runtime 输入（`CheckInputsOutputs(op_sig, /*runtime=*/1, /*outputs=*/1)`）。
+常量输入（如被 `FP16GraphPartitionHelper::RemapFp16InputTensors` 重映射成
+fp16 mmap 常量）时 runtime 输入为 0 → 拒。
+
+修复（两处树都改了，注意 `use_litert_tflite=false` 时编译的是
+`third_party/tflite/src/tensorflow/lite/tools/versioning/gpu_compatibility.cc`；
+`litert/BUILD.gn:1346` 编译的也是 litert 树的拷贝——两处都改了）：
+
+```cpp
+case kTfLiteBuiltinReshape: {
+  const int runtime_inputs = GetNumberOfRuntimeInputs(op_sig);
+  if (runtime_inputs < 0 || runtime_inputs > 1) { ...error... }
+  if (op_sig.outputs.size() != 1) { ...error... }
+  return absl::OkStatus();
+}
+```
+
+配套 `ReshapeOperationParser::Parse`：
+- `runtime_inputs == 0`：用 `reader->ReadTensor` 读常量，把输出 shape 写到
+  `TensorFloat32`，emit `CONSTANT` 节点（reshape 只是逻辑维度变化，数据不动）。
+- `runtime_inputs >= 1`：正常 `RESHAPE` 节点。
+
+### 3.1.2 RESHAPE/TRANSPOSE 5D 支持
+
+`IsAllAllowedTensors` 原来一刀切拒 `dims->size >= 5`（"Tensor dimensions
+must be less than 5"）。放宽到 `> 5`（允许 5D，仍拒 6D）。
+
+配套改动：
+- `ReshapeOperationParser::Parse`：输出 rank==5 时用
+  `Reshape3DAttributes`（BHWDC）。
+- `TransposeOperationParser::IsSupported`：perm size 上限 `4 → 5`。
+- `TransposeOperationParser::Parse`：perm size==5 用 `Transpose3DAttributes`。
+- ml-drift `operation_selector.cc` 的 legacy `GPUOperationFromNode`：
+  RESHAPE/TRANSPOSE 都补了 `Reshape3DAttributes`/`Transpose3DAttributes`
+  分支（原来 `std::any_cast<ReshapeAttributes>` 在 5D 时抛
+  `std::bad_any_cast`）。
+- ml-drift `transformations/remove_noop.cc` 的 `RemoveIdentityReshape`：
+  遇到 `Reshape3DAttributes` 直接 SKIPPED（不再 bad_any_cast）。
+
+### 3.1.3 TRANSPOSE 0 runtime 输入
+
+同 RESHAPE：`gpu_compatibility.cc` 的 TRANSPOSE 分支接受 0-1 个 runtime
+输入。`Parse` 里 `runtime_inputs == 0` 时读常量数据 + permutation，在 CPU
+上做转置（新增 `TransposeConstantData` 辅助函数，只处理 4D BHWC），emit
+`CONSTANT` 节点。
+
+### 3.1.4 结果
+
+全部 1260 个算子通过 GPU delegate 支持检查（full delegation）。
+DEQUANTIZE 的拒绝来自 `FP16GraphPartitionHelper::IsNodeSupported`
+（fp16 常量 DEQUANTIZE 故意返回 false，full delegation 场景会重新纳入），
+不是 parser 问题。
+
+## 3.2 Delegation 日志
+
+`GetOpsToReplaceWithOptions` 的委托摘要原本走 `TF_LITE_KERNEL_LOG` → 
+`context->ReportError`。LiteRT runtime 默认 `error_reporter_mode =
+kLiteRtErrorReporterModeNone` → 输出全丢。
+
+修复链（`services/webnn/tflite/graph_impl_litert.cc`）：
+1. `GetCompilationOptions` 里 `SetErrorReporterMode(kLiteRtErrorReporterModeBuffer)`
+2. `CompiledModel::Create` 后用 `model_->GetErrorMessages()` 把 buffer 内容
+   `LOG(ERROR)` 出来 → `[WebNN] LiteRT compilation diagnostics: ...`
+3. Run 失败时同样 dump（`[WebNN] LiteRT run diagnostics`）
+
+另有 `delegate_webgpu.cc` 的 per-node GPU/CPU 委托清单（`TF_LITE_KERNEL_LOG`）、
+`model_builder.cc` 的 "All N operations are supported" 分支。
+
+## 3.3 OOM 根因链
+
+### 3.3.1 静态分析
+
+脚本 `tflite-dump-model/analyze_arena.py` 模拟 `ArenaPlanner` 的
+first-fit-by-offset + lifetime 复用，对 `new_segment_anything_encoder.tflite`：
+
+| 项目 | 数值 |
+|---|---|
+| Ops | 1260 |
+| 常量权重（mmap，不进 arena） | 175.2 MB |
+| Arena（非常量）张量 | 1233 个 |
+| arena 张量大小总和 | 46.8 GB |
+| **arena high-water mark** | **≈1.63 GB**（与实测 1673527296 B ≈ 1596 MB 吻合） |
+| 最大单张量 | 768 MB × 多组（BATCH_MATMUL 中间张量，lifetime 各 1 个 node） |
+
+### 3.3.2 为什么 full delegation 下 arena 还是大
+
+- `AllocateTensors` 在 delegate 替换 **之前** 按原始执行计划规划 arena：
+  全部 1233 个张量按 lifetime 打包 → 峰值 1.6 GB。
+- delegate 替换后中间张量离开 arena，但 arena 底层 buffer **不收缩**。
+- 每次 `ModifyGraphWithDelegate` 都触发一次 `EnsureMemoryAllocations`
+  （STEP 3）→ 重新规划 + 重新 Commit。
+
+### 3.3.3 为什么有两次 AllocateTensors（第二次 2 GB → OOM）
+
+WebNN 的 `GetCompilationOptions` 注册了 **GPU + CPU(XNNPACK) 两个
+accelerator**。`compiled_model.cc` 的 delegate 循环为每个 accelerator 调用
+一次 `ModifyGraphWithDelegate`：
+
+1. GPU delegate：STEP 3 CASE 1 → `EnsureMemoryAllocations` →
+   分配 1.6 GB（成功），state → `kStateInvokableAndImmutable`
+2. CPU delegate：STEP 3 CASE 2（`pre_delegation_state ==
+   kStateInvokableAndImmutable`）→ 再次 `EnsureMemoryAllocations` →
+   2 GB → PartitionAlloc `PartitionExcessiveAllocationSize` → 崩溃
+
+### 3.3.4 `OptimizeMemoryForLargeTensors` 修复
+
+目标：`AllocateTensors` 之前把大张量从 `kTfLiteArenaRw` 改成
+`kTfLiteDynamic`（独立 malloc，不走 arena）。
+
+问题 1：`interpreter_options.OptimizeMemoryForLargeTensors(1<<20)` 只设置了
+选项，`Subgraph::OptimizeMemoryForLargeTensors()` **没有人调用**。修复：
+`compiled_model.cc` 在 `builder(&interp_)` 之后对每个 subgraph 显式调用。
+
+问题 2：该函数用 `tensor->bytes` 判断大小，但此时 `bytes` 还是 0（第一次
+`AllocateTensors` 之前）。修复：`bytes==0` 时从 `dims` × 元素大小推算。
+
+问题 3：改为 `kTfLiteDynamic` 后，TFLite 的 dynamic-tensor 检查会拒
+static-shape-only delegate。修复：delegate 加
+`kTfLiteDelegateFlagsAllowDynamicTensors`（delegate_webgpu.cc）。该 flag
+使 `ModifyGraphWithDelegateImpl` 跳过 dynamic 检查，且 STEP 3 对
+`pre_state==kStateUninvokable` 走 "no allocation needed" 分支——**编译期零
+arena 分配**，第一次 Run 时才 `AllocateTensors`。
+
+实测日志：
+```
+[webnn-oom] OptimizeMemoryForLargeTensors: converted=1105 skipped_input=1 skipped_bytes=734 total=1840
+```
+
+### 3.3.5 GPU-only 模式（disable CPU fallback）
+
+新增 switch `--webnn-tflite-gpu-only`：
+- `webnn_switches.h/.cc` 注册 switch 并加入
+  `GetWebNNSwitchesCopiedFromGpuProcessHost()` 转发白名单
+  （**不加白名单 switch 根本到不了 WebNN 进程**——这是曾经 "开关无效" 的原因）。
+- `graph_impl_litert.cc` `GetCompilationOptions`：switch 存在时跳过
+  `accelerators |= kCpu` 及全部 CPU options。
+- 效果：只有一个 GPU delegate → 只一次 `ModifyGraphWithDelegate`。
+- 注意 `compiled_model.cc:1029`：无 kCpu 且存在 non-delegated ops 时
+  编译报错（全 GPU 支持时不会触发）。
+
+"Created TensorFlow Lite XNNPACK delegate for CPU" 不再出现；
+"CpuAccelerator registered" 仍会出现（注册 ≠ 创建 delegate，
+`auto_registration.cc` 默认注册全部 accelerator，选择靠
+`SetHardwareAccelerators` 位掩码过滤，`compiled_model.cc:982-984`）。
+
+## 3.4 当前状态：Invoke 失败（待查）
+
+```
+[webnn-delegate] ModifyGraphWithDelegateImpl: flags=1 supports_dynamic=1 hint_full=0 pre_state=0
+ERROR: [litert_compiled_model.cc:164] Failed to invoke
+```
+
+- 编译成功（OOM 已解决）。第一次 Run 的 `AllocateTensors` 也通过
+  （否则报 "Failed to allocate tensors"）。
+- `runner->Invoke()` 返回错误 → `compiled_model.cc:2015` "Failed to invoke"。
+- 已加诊断：invoke 失败时 dump `BufferErrorReporter` 内容
+  （`[webnn-run] invoke error: ...`），WebNN 侧 Run 失败也 dump。
+- 待查方向：
+  1. 本机 GPU 受限（EGL 仅 GLES 3.0、无 OpenCL）→ WebGPU execute 失败；
+  2. delegate kernel Init 推迟到第一次 Run（Create 时 STEP 3 零分配）→
+     GPU graph 构建问题在这里才暴露；
+  3. constant-input RESHAPE/TRANSPOSE 生成的 CONSTANT 节点导致 GPU graph
+     异常。
+
+## 3.5 修改文件清单
+
+| 树 | 文件 | 修改 |
+|---|---|---|
+| tflite | `src/tensorflow/lite/tools/versioning/gpu_compatibility.cc` | RESHAPE/TRANSPOSE 接受 0-1 runtime 输入 |
+| tflite | `src/tensorflow/lite/core/subgraph.cc` | `OptimizeMemoryForLargeTensors` bytes 推算 + 计数日志；`ResizeTensorImpl` 大张量日志；`ModifyGraphWithDelegateImpl` STEP3 分支日志 |
+| litert | `src/tflite/tools/versioning/gpu_compatibility.cc` | 同上（litert 树拷贝） |
+| litert | `src/ml_drift_delegate/tflite/model_builder.cc` | IsAllAllowedTensors 放行 5D；Reshape/Transpose Parse 常量路径 + 5D；delegation 日志 |
+| litert | `src/ml_drift_delegate/delegate/delegate_webgpu.cc` | `kTfLiteDelegateFlagsAllowDynamicTensors`；per-node 委托日志 |
+| litert | `src/ml_drift_delegate/delegate/delegate_kernel.cc` | 阶段日志（BuildFinalModel/GraphToGpuModel） |
+| litert | `src/litert/runtime/compiled_model.cc` | 显式调用 `OptimizeMemoryForLargeTensors`；invoke 失败 dump errors |
+| ml-drift | `ml_drift/common/selectors/operation_selector.cc` | legacy GPUOperationFromNode 支持 3D(5D) attr |
+| ml-drift | `ml_drift/common/transformations/remove_noop.cc` | RemoveIdentityReshape 跳过 5D attr |
+| chromium | `services/webnn/tflite/graph_impl_litert.cc` | BufferErrorReporter、OOM 诊断、Run 诊断、gpu-only switch |
+| chromium | `services/webnn/webnn_switches.h/.cc` | `--webnn-tflite-gpu-only` switch + 转发白名单 |
