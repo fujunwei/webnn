@@ -12,8 +12,8 @@
 # Output: $DEST\libc++.lib (~3 MB)
 
 param(
-    [string]$ChromiumSrc = "C:\Users\junweifu\workspace\chromium\src",
-    [string]$Dest        = "C:\Users\junweifu\workspace\webnn\_cr_libcxx_link_win"
+    [string]$ChromiumSrc = "C:\Users\fujun\workspace\chromium\src",
+    [string]$Dest        = "C:\Users\fujun\workspace\webnn\_cr_libcxx_link_win"
 )
 
 $ErrorActionPreference = "Stop"
@@ -32,7 +32,9 @@ New-Item -ItemType Directory -Force -Path $Dest | Out-Null
 $rsp  = Join-Path $Dest "objs.rsp"
 $objs = Get-ChildItem "$OBJDIR\*.obj" | ForEach-Object { '"' + $_.FullName + '"' }
 if ($objs.Count -eq 0) { throw "No .obj files in $OBJDIR" }
-($objs -join "`r`n") | Set-Content -Path $rsp -Encoding ASCII
+# Join with newlines so lld-link sees one path per line (Out-File -NoNewline
+# would concatenate them into a single invalid path).
+$objs -join "`n" | Out-File -FilePath $rsp -Encoding ASCII
 
 $out = Join-Path $Dest "libc++.lib"
 & $LLD /lib /NOLOGO "/OUT:$out" "@$rsp"

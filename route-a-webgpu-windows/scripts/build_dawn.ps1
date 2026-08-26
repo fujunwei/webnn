@@ -15,12 +15,17 @@
 #   - $ChromiumVersion should match the Chrome build the DLL will be loaded into.
 
 param(
-    [string]$SrcDir           = "C:\Users\junweifu\workspace\webnn\_webgpu_dawn_src",
-    [string]$Dest             = "C:\Users\junweifu\workspace\webnn\_dawn_prebuilt_win",
-    [string]$ChromiumVersion  = "147.0.7714.2"
+    [string]$SrcDir           = "C:\Users\fujun\workspace\webnn\_webgpu_dawn_src",
+    [string]$Dest             = "C:\Users\fujun\workspace\webnn\_dawn_prebuilt_win",
+    [string]$ChromiumVersion  = "153.0.8010.0"
 )
 
 $ErrorActionPreference = "Stop"
+
+# Refresh PATH from the registry (Machine + User) so freshly installed tools
+# (cmake, python, git) are found even when the invoking shell has a stale env.
+$env:Path = [Environment]::GetEnvironmentVariable("Path", "Machine") + ";" +
+            [Environment]::GetEnvironmentVariable("Path", "User")
 
 if (-not (Test-Path $SrcDir)) {
     Write-Host "Cloning webgpu-dawn-binaries into $SrcDir..."
