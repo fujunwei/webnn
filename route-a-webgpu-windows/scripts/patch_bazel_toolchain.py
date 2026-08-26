@@ -72,7 +72,7 @@ LIBCXX_ENTRIES_TEMPLATE = [
     r"{cr}\buildtools\third_party\libc++",
     # Bazel misdetects the clang builtin dir (parses a hash suffix by mistake).
     # Add the real path so <stdint.h>, <vadefs.h> etc. from clang's headers pass.
-    r"{cr}\third_party\llvm-build\Release+Asserts\lib\clang\23\include",
+    r"{cr}\third_party\llvm-build\Release+Asserts\lib\clang\24\include",
 ]
 
 def escape_for_bazel(p):
@@ -96,9 +96,9 @@ def main():
     with open(BUILD, "r", encoding="utf-8") as f:
         content = f.read()
 
-    # Strip previously-injected entries (libc++ or clang\23 paths).
+    # Strip previously-injected entries (libc++ or any clang version path).
     content = re.sub(
-        r',\s*"[^"]*(?:libc\+\+|llvm-build[^"]*clang\\\\23)[^"]*"',
+        r',\s*"[^"]*(?:libc\+\+|llvm-build[^"]*clang\\\\\d+)[^"]*"',
         "",
         content,
     )
