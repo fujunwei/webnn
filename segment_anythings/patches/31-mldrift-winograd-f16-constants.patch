@@ -1,0 +1,77 @@
+ml-drift: bake Winograd transform constants as FLOAT32 in WGSL
+
+The 3x3-conv Winograd kernels bake the Bt/At transform matrices into the
+WGSL source via BufferToKernelLanguage, using the input tensor's data type.
+In fp16 mode that yields `const Bt_buffer = array<f16, 36>(...)`, which Dawn
+rejects on devices without the shader-f16 feature ("'f16' type used without
+'f16' extension enabled"). The invalid shader makes the whole command buffer
+invalid, so the dispatch silently never runs and the output buffers stay
+zero-initialized: the fused SAM encoder (single GPU fragment, fp16 mode)
+read back exactly 1048576 zeros with nan=0 and no error.
+
+Root-caused with a shader-dump hook (patch 32): the only two WGSL modules
+containing f16 were the Winograd Bt/At kernels. The fix bakes the constants
+as FLOAT32 in all four call sites; the kernels already read them into f32
+arrays, so precision only improves (f16 baking also quantized values like
+sqrt(0.5) to 0.70703125).
+
+Verified on the Intel UHD 630 (no shader-f16): new fused model fp16 now
+outputs cosine=0.999977 vs the same model at fp32, and no WGSL validation
+errors remain. The fp32 path was already unaffected (src data type = f32).
+
+
+diff --git a/ml_drift/common/kernels/winograd.cc b/ml_drift/common/kernels/winograd.cc
+index aed597d..faf25bf 100644
+--- a/ml_drift/common/kernels/winograd.cc
++++ b/ml_drift/common/kernels/winograd.cc
+@@ -253,9 +253,9 @@ Winograd4x4To36 CreateWinograd4x4To36(const OperationDef& definition,
+   desc.args_.AddInt("tiles_y");
+ 
+   BufferDescriptor buffer_desc;
++  // See Winograd3x3TiledXForward::UploadBt: keep the baked constants f32.
+   VectorToKernelBufferDesc(BtMatrixForWinograd3x3TileNxN(/*tile_size*/ 6),
+-                           definition.dst_tensors[0].GetDataType(),
+-                           &buffer_desc);
++                           DataType::FLOAT32, &buffer_desc);
+   desc.args_.AddObject(
+       "Bt", std::make_unique<BufferDescriptor>(std::move(buffer_desc)));
+ 
+@@ -533,8 +533,12 @@ void Winograd3x3TiledXForward::UploadBt(const OperationDef& op_def) {
+                                         std::move(bt_tensor_desc)));
+ 
+   BufferDescriptor buffer_desc;
+-  VectorToKernelBufferDesc(bt_mat, op_def.src_tensors[0].GetDataType(),
+-                           &buffer_desc);
++  // Bake the transform constants as FLOAT32 regardless of the tensor data
++  // type: the kernel reads them into f32 arrays (the winograd math runs in
++  // f32), and emitting array<f16, N> in the WGSL source is rejected on
++  // devices without the shader-f16 feature ("'f16' type used without 'f16'
++  // extension enabled"), which silently kills the whole dispatch.
++  VectorToKernelBufferDesc(bt_mat, DataType::FLOAT32, &buffer_desc);
+   args_.AddObject("Bt",
+                   std::make_unique<BufferDescriptor>(std::move(buffer_desc)));
+ }
+@@ -618,9 +622,10 @@ Winograd36To4x4 CreateWinograd36To4x4(
+                                      std::move(bias_tensor_desc)));
+ 
+   BufferDescriptor buffer_desc;
++  // See UploadBt: bake as FLOAT32 so the WGSL stays free of f16 types on
++  // devices without the shader-f16 feature.
+   VectorToKernelBufferDesc(AtMatrixForWinograd3x3TileNxN(/*tile_size*/ 6),
+-                           definition.src_tensors[0].GetDataType(),
+-                           &buffer_desc);
++                           DataType::FLOAT32, &buffer_desc);
+   desc.args_.AddObject(
+       "At", std::make_unique<BufferDescriptor>(std::move(buffer_desc)));
+ 
+@@ -771,8 +776,8 @@ void Winograd3x3TiledXBackward::UploadAt(const OperationDef& op_def) {
+                                         std::move(at_tensor_desc)));
+ 
+   BufferDescriptor buffer_desc;
+-  VectorToKernelBufferDesc(at_mat, op_def.src_tensors[0].GetDataType(),
+-                           &buffer_desc);
++  // See Winograd3x3TiledXForward::UploadBt: keep the baked constants f32.
++  VectorToKernelBufferDesc(at_mat, DataType::FLOAT32, &buffer_desc);
+   args_.AddObject("At",
+                   std::make_unique<BufferDescriptor>(std::move(buffer_desc)));
+ }

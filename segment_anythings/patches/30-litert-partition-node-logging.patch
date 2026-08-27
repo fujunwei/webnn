@@ -1,0 +1,46 @@
+litert: log which nodes the GPU delegate actually takes
+
+The [node-table] dump lists every node considered for delegation. On a
+partially-delegated model that is far more than what runs on the GPU --
+the SAM encoder's decomposed variant offers 1960 nodes and delegates 207
+of them, in 170 fragments -- which makes LITERT_GPU_DEBUG_EXCLUDE_NODES
+experiments look like no-ops when the excluded class was never delegated
+in the first place.
+
+Print delegate_params->nodes_to_replace under the existing
+LITERT_GPU_DEBUG_DUMP_NODES flag.
+
+diff --git a/ml_drift_delegate/delegate/delegate_kernel.cc b/ml_drift_delegate/delegate/delegate_kernel.cc
+index edadb2c6c..1382d0c39 100644
+--- a/ml_drift_delegate/delegate/delegate_kernel.cc
++++ b/ml_drift_delegate/delegate/delegate_kernel.cc
+@@ -22,6 +22,7 @@
+ 
+ #include <algorithm>
+ #include <cstdint>
++#include <cstdlib>
+ #include <cstring>
+ #include <iostream>
+ #include <memory>
+@@ -226,6 +228,21 @@ absl::Status DelegateKernel::Initialize(
+ 
+ absl::Status DelegateKernel::InitializeGraphFloat32(
+     TfLiteContext* context, const TfLiteDelegateParams* delegate_params) {
++  // Which nodes actually made it into the GPU partition. The [node-table] dump
++  // lists every *candidate*; on a partially-delegated model that can be an
++  // order of magnitude more nodes than really run on the GPU, which makes
++  // LITERT_GPU_DEBUG_EXCLUDE_NODES experiments look like no-ops.
++  if (std::getenv("LITERT_GPU_DEBUG_DUMP_NODES") != nullptr &&
++      delegate_params->nodes_to_replace != nullptr) {
++    std::string ids;
++    for (int i = 0; i < delegate_params->nodes_to_replace->size; ++i) {
++      if (i != 0) ids += ",";
++      absl::StrAppend(&ids, delegate_params->nodes_to_replace->data[i]);
++    }
++    ABSL_LOG(INFO) << "[partition] " << delegate_params->nodes_to_replace->size
++                   << " nodes delegated: " << ids;
++  }
++
+   SharedConstTensorsMap shared_tensors;
+   SharedConstTensorsMap* shared_tensors_ptr = nullptr;
+   const TensorIndexToBufferIdMap* tensor_to_buffer_id_map = nullptr;
