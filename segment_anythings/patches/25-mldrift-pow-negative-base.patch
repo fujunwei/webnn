@@ -1,0 +1,66 @@
+ml-drift: guard pow() against negative bases off the OpenCL path
+
+WGSL, MSL and GLSL all leave pow(x, y) undefined for x < 0; Dawn lowers
+it to exp2(y * log2(x)), which is NaN. The OpenCL path already handles
+this via PowUsingNativePowr, but the shared non-OpenCL path emitted a
+bare pow($1, $2).
+
+Any decomposed LayerNorm computes pow(x - mean, 2), and x - mean is
+negative for about half of its elements, so a single such node turns the
+whole downstream tensor into NaN once the following MEAN spreads it. On
+the SAM encoder this made all 1048576 output elements NaN; excluding just
+the two POW nodes (delegate indices 1229 and 1248) restored finite output.
+
+The existing pow(x,2) -> x*x lowering does not help here because it lives
+in CreateElementwiseOneRuntimeOneScalar, and this model reaches POW with a
+runtime exponent (an fp16 constant 2.0 behind DEQUANTIZE -> RESHAPE), so
+the two-input kernel is selected instead.
+
+Mirrors PowUsingNativePowr's contract, including its treatment of a
+non-integer exponent with a negative base.
+
+diff --git a/ml_drift/common/kernels/elementwise.cc b/ml_drift/common/kernels/elementwise.cc
+index 4019188..3b7851e 100644
+--- a/ml_drift/common/kernels/elementwise.cc
++++ b/ml_drift/common/kernels/elementwise.cc
+@@ -118,6 +118,31 @@ std::string PowUsingNativePowr(const std::string& x_name,
+   return c;
+ }
+ 
++// Same contract as PowUsingNativePowr above, for the backends that do not use
++// the OpenCL builtins. WGSL, MSL and GLSL all leave pow(x, y) undefined for
++// x < 0 -- Dawn lowers it to exp2(y * log2(x)), which is NaN -- so a bare
++// pow() silently poisons any graph containing pow(x - mean, 2), i.e. every
++// decomposed LayerNorm.
++//
++// Evenness is tested with floor(y/2)*2 == y rather than an int conversion,
++// which has no portable spelling here. Non-integer y with x < 0 has no real
++// result; it takes the negative branch, matching PowUsingNativePowr.
++std::string PowHandlingNegativeBase(const std::string& x_name,
++                                    const std::string& y_name,
++                                    const std::string& dst_name) {
++  std::string c;
++  const std::string postfixes[4] = {".x", ".y", ".z", ".w"};
++  for (int i = 0; i < 4; ++i) {
++    c += absl::Substitute(R"(
++    if ($0 >= 0.0) { $2 = pow($0, $1); }
++    else if (floor($1 * 0.5) * 2.0 == $1) { $2 = pow(-$0, $1); }
++    else { $2 = -pow(-$0, $1); })",
++                          x_name + postfixes[i], y_name + postfixes[i],
++                          dst_name + postfixes[i]);
++  }
++  return c;
++}
++
+ std::string GetOneInputCode(const GpuInfo& gpu_info,
+                             const OperationType& op_type,
+                             const DataType& data_type,
+@@ -423,7 +448,7 @@ std::string GetTwoInputCode(const GpuInfo& gpu_info,
+         result += "$0 = ucl::Convert<" + ToUclDataType(data_type, 4) +
+                   ">(out_f32);\n";
+       } else {
+-        result += "$0 = pow($1, $2);";
++        result += PowHandlingNegativeBase("$1", "$2", "$0");
+       }
+       break;
+     case OperationType::SQUARED_DIFF:

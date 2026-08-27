@@ -1,0 +1,72 @@
+litert: recover the real shape of rank-5 values for ml-drift
+
+BuildFinalModel() records every value's shape through
+ExtractTensorShape(), which drops everything past the 4th dimension
+because GraphFloat32::Value holds a TensorRef<BHWC>. ml-drift then
+allocated rank-5 tensors far too small (see the companion ml-drift patch
+adding CreateGpuModelInfo::rank5_shapes).
+
+Value::tensor.ref is the TFLite tensor index, so the original dims are
+still reachable after BuildFinalModel() returns. Walk the graph values
+once and populate rank5_shapes, guarding against a stale ref by checking
+that the truncation of those dims is what the value actually carries.
+
+This covers every op uniformly rather than each parser separately: on the
+SAM encoder 140 rank-5 tensors are produced by RESHAPE, TRANSPOSE and
+broadcast ADD.
+
+diff --git a/ml_drift_delegate/delegate/BUILD b/ml_drift_delegate/delegate/BUILD
+index 345cbe63b..57820b939 100644
+--- a/ml_drift_delegate/delegate/BUILD
++++ b/ml_drift_delegate/delegate/BUILD
+@@ -531,6 +531,7 @@ cc_library(
+         "//ml_drift_delegate/tflite:ir_model_builder",
+         "//ml_drift_delegate/tflite:ir_model_builder_helper",
+         "//ml_drift_delegate/tflite:model_builder",
++        "//ml_drift_delegate/tflite:model_builder_helper",
+         "//ml_drift_delegate/tflite:object_reader",
+         "//ml_drift_delegate/tflite:shared_const_tensor_map",
+         "//weight_loader:external_weight_loader",
+diff --git a/ml_drift_delegate/delegate/delegate_kernel.cc b/ml_drift_delegate/delegate/delegate_kernel.cc
+index edadb2c6c..1382d0c39 100644
+--- a/ml_drift_delegate/delegate/delegate_kernel.cc
++++ b/ml_drift_delegate/delegate/delegate_kernel.cc
+@@ -75,6 +76,7 @@
+ #include "ml_drift_delegate/tflite/ir_model_builder.h"
+ #include "ml_drift_delegate/tflite/ir_model_builder_helper.h"
+ #include "ml_drift_delegate/tflite/model_builder.h"
++#include "ml_drift_delegate/tflite/model_builder_helper.h"
+ #include "ml_drift_delegate/tflite/object_reader.h"
+ #include "ml_drift_delegate/tflite/shared_const_tensor_map.h"
+ #include "weight_loader/external_weight_loader_litert.h"
+@@ -304,6 +321,30 @@ absl::Status DelegateKernel::InitializeGraphFloat32(
+   ::ml_drift::CreateGpuModelInfo create_info;
+   create_info.precision = delegate_data_->calculation_precision;
+   create_info.storage_type = GetStorageType();
++
++  // Recover the true shape of rank-5 values.
++  //
++  // BuildFinalModel() stores every value's shape through ExtractTensorShape(),
++  // which drops everything past the 4th dimension because GraphFloat32::Value
++  // holds a TensorRef<BHWC>. Left alone, ml-drift would allocate a
++  // [5,14,5,14,768] tensor as BHWC(5,14,5,14) -- 768x too small -- and the
++  // whole SAM window-attention path would read garbage. Value::tensor.ref is
++  // the TFLite tensor index, so the original dims are still reachable here.
++  for (const ::ml_drift::Value* value : graph.values()) {
++    if (value->tensor.ref < 0 || value->tensor.ref >= context->tensors_size) {
++      continue;
++    }
++    const TfLiteTensor& tflite_tensor = context->tensors[value->tensor.ref];
++    const TfLiteIntArray* dims = tflite_tensor.dims;
++    if (dims == nullptr || dims->size != 5) continue;
++    // Guard against a stale ref: graph transformations may have rewired the
++    // value after BuildFinalModel(). If the truncation of these dims is not
++    // what the value actually carries, the ref no longer describes it.
++    if (ExtractTensorShape(&tflite_tensor) != value->tensor.shape) continue;
++    create_info.rank5_shapes[value->id] =
++        ::ml_drift::BHWDC(dims->data[0], dims->data[1], dims->data[2],
++                          dims->data[3], dims->data[4]);
++  }
+ #ifdef __APPLE__
+   create_info.hints.use_metal_argument_buffers =
+       delegate_data_->options->use_metal_argument_buffers;

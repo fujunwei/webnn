@@ -10,12 +10,17 @@
 
 param(
     [ValidateSet("dbg","opt")] [string]$Mode = "dbg",
-    [string]$ChromiumSrc = "C:\Users\junweifu\workspace\chromium\src",
-    [string]$WebnnDir    = "C:\Users\junweifu\workspace\webnn",
-    [string]$MlDrift     = "C:\Users\junweifu\workspace\chromium\src\third_party\ml-drift"
+    [string]$ChromiumSrc = "C:\Users\fujun\workspace\chromium\src",
+    [string]$WebnnDir    = "C:\Users\fujun\workspace\webnn",
+    [string]$MlDrift     = "C:\Users\fujun\workspace\chromium\src\third_party\ml-drift"
 )
 
 $ErrorActionPreference = "Continue"
+
+# Refresh PATH from the registry (Machine + User) so freshly installed tools
+# (bazel, python) are found even when the invoking shell has a stale env.
+$env:Path = [Environment]::GetEnvironmentVariable("Path", "Machine") + ";" +
+            [Environment]::GetEnvironmentVariable("Path", "User")
 
 $LITERT = Join-Path $ChromiumSrc "third_party\litert\src"
 if (-not (Test-Path $LITERT)) { throw "litert src not found at $LITERT" }
@@ -40,9 +45,11 @@ Write-Host "  DAWN dir:     $env:DAWN_PREBUILT_DIR"
 Write-Host ""
 
 $logPath = Join-Path $WebnnDir "build_crcxx_$Mode.log"
+# NOTE: ml_drift is wired via local_repository in WORKSPACE (with repo_mapping
+# @fp16 -> @FP16). Do NOT pass --override_repository here: it would replace the
+# local_repository definition and drop the repo_mapping, breaking @fp16 deps.
 bazel build --config=windows --config=crcxx_win --check_visibility=false `
     "--shell_executable=C:/Program Files/Git/bin/bash.exe" `
-    "--override_repository=ml_drift=$MlDrift" `
     -c $Mode `
     //litert/runtime/accelerators/gpu:ml_drift_webgpu_accelerator_dll 2>&1 |
     Tee-Object -FilePath $logPath

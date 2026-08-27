@@ -83,13 +83,23 @@ out\Release\sam_encoder_runner.exe --model=C:\...\model.tflite --verify --tolera
 ### 3.4 外部输入 + dump 完整输出（离线 diff）
 
 ```powershell
-out\Release\sam_encoder_runner.exe --model=C:\...\model.tflite --verify `
-    --input=C:\...\input.bin --dump-outputs=C:\...\sam_enc
-# 产出 sam_enc_cpu.bin / sam_enc_gpu.bin
+# 实测：MobileNet + tiger_input.bin，GPU vs CPU 对比（--dump-outputs 是文件名前缀）
+.\out\upstream_bots_debug\sam_encoder_runner.exe --model=D:\tflite-dump-model\mobilenet_verify\mobilenet.tflite --verify `
+    --input=D:\tflite-dump-model\tiger_input.bin --dump-outputs=D:\tflite-dump-model\mobilenet_verify --precision=fp32
+# 产出 D:\tflite-dump-model\mobilenet_verify_cpu.bin / mobilenet_verify_gpu.bin
 
-out\Release\sam_encoder_runner.exe --model=C:\...\model.tflite --run `
-    --input=C:\...\input.bin --dump-outputs=C:\...\sam_enc_run
-# 产出 sam_enc_run.bin
+.\out\upstream_bots_debug\sam_encoder_runner.exe --model=D:\tflite-dump-model\resnet_verify\resnet.tflite --verify `
+    --input=D:\tflite-dump-model\tiger_input.bin --dump-outputs=D:\tflite-dump-model\resnet_verify\fp32 --precision=fp32
+
+.\out\upstream_bots_debug\sam_encoder_runner.exe --model=D:\tflite-dump-model\segment_anything_verify\segment_anything_encoder.tflite --verify `
+    --input=D:\tflite-dump-model\segment_anything_verify\sam_enc_input.bin --dump-outputs=D:\tflite-dump-model\segment_anything_verify\fp32 --precision=fp32
+
+.\out\upstream_bots_debug\sam_encoder_runner.exe --model=D:\tflite-dump-model\segment_anything_verify\new_segment_anything_encoder.tflite --run --runs=1 `
+    --input=D:\tflite-dump-model\segment_anything_verify\sam_enc_input.bin --dump-outputs=D:\tflite-dump-model\segment_anything_verify\fp32 --precision=fp32
+
+out\Release\sam_encoder_runner.exe --model=D:\tflite-dump-model\mobilenet_verify\mobilenet.tflite --run `
+    --input=D:\tflite-dump-model\tiger_input.bin --dump-outputs=D:\tflite-dump-model\mobilenet_verify
+# 产出 D:\tflite-dump-model\mobilenet_verify_run.bin
 ```
 
 输入 bin 生成（row-major f32，与模型输入张量一致）：
@@ -104,16 +114,16 @@ x.tofile(r'C:\...\input.bin')
 
 ```python
 import numpy as np
-cpu = np.fromfile(r'C:\...\sam_enc_cpu.bin', dtype=np.float32)
-gpu = np.fromfile(r'C:\...\sam_enc_gpu.bin', dtype=np.float32)
+cpu = np.fromfile(r'D:\tflite-dump-model\mobilenet_verify_cpu.bin', dtype=np.float32)
+gpu = np.fromfile(r'D:\tflite-dump-model\mobilenet_verify_gpu.bin', dtype=np.float32)
 d = np.abs(gpu - cpu)
 print('elems', cpu.size, 'max_abs', d.max(), 'mean_abs', d.mean())
 idx = np.argwhere(d > 1e-2).ravel()
 print('over_tol', idx.size, 'first_bad', idx[:20])
 
-d4 = d.reshape(256, 64, 64)          # 例：SAM encoder 输出 1x256x64x64，按通道定位
-per_ch = d4.mean(axis=(1, 2))
-print('worst channels', np.argsort(per_ch)[::-1][:10])
+# 分类模型（1x1001 logits）：直接看 top-1/top-5 是否一致
+print('cpu top-5:', np.argsort(cpu)[::-1][:5])
+print('gpu top-5:', np.argsort(gpu)[::-1][:5])
 ```
 
 ### 3.5 图像输入预处理（SAM / MobileNet）

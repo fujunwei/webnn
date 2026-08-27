@@ -177,7 +177,7 @@ index a749b355c..480c20679 100755
        return false;
      }
      return true;
-@@ -7052,7 +7254,54 @@ TfLiteIntArray* GetOpsToReplaceWithOptions(
+@@ -7052,8 +7254,55 @@ TfLiteIntArray* GetOpsToReplaceWithOptions(
                        partition_helper.num_total_nodes());
      }
      absl::StrAppend(&error_message, " operations will run on the CPU.");

@@ -19,7 +19,7 @@ import sys
 # ---- EDIT: paths for your machine ----
 CHROMIUM_SRC = os.environ.get(
     "CHROMIUM_SRC",
-    r"C:\Users\junweifu\workspace\chromium\src",
+    r"C:\Users\fujun\workspace\chromium\src",
 )
 # Where to run `bazel info output_base`. Must be a Bazel workspace.
 BAZEL_WORKSPACE = os.environ.get(

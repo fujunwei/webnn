@@ -4,18 +4,21 @@ Completes 5D (BHWDC) reshape/transpose support in ml-drift:
 
 - add std::any_cast branches for Reshape3DAttributes and
   Transpose3DAttributes in the legacy GPUOperationFromNode selector;
-- demote the 5D shape-mismatch warning in UpdateOutputTensors to VLOG(1)
-  (known upstream axis-relabeling limitation, execution unaffected);
 - skip 5D identity-reshape in RemoveIdentityReshape to avoid
   std::bad_any_cast.
 
-Merges former patches 24, 25, 26.
+NOTE: an earlier revision of this patch also demoted the shape-mismatch
+warning in GpuModelBuilder::UpdateOutputTensors to VLOG(1), on the theory
+that the mismatch was a harmless axis-relabeling artifact. That was wrong
+-- the truncated shape is the one installed by SetOutputDescriptor(), so
+the warning marks real data loss. That hunk is deliberately gone; see
+patch 26, which removes the mismatch instead of hiding it.
 
 diff --git a/ml_drift/common/selectors/operation_selector.cc b/ml_drift/common/selectors/operation_selector.cc
-index a729d68..60302f2 100644
+index c640580..6bd60e7 100644
 --- a/ml_drift/common/selectors/operation_selector.cc
 +++ b/ml_drift/common/selectors/operation_selector.cc
-@@ -1022,11 +1029,17 @@ absl::Status GPUOperationFromNode(const GpuInfo& gpu_info,
+@@ -1023,11 +1030,17 @@ absl::Status GPUOperationFromNode(const GpuInfo& gpu_info,
        return absl::OkStatus();
      }
      case OperationType::RESHAPE: {
@@ -37,7 +40,7 @@ index a729d68..60302f2 100644
      }
      case OperationType::RESIZE: {
        const auto& attr =
-@@ -1122,11 +1135,17 @@ absl::Status GPUOperationFromNode(const GpuInfo& gpu_info,
+@@ -1123,11 +1136,17 @@ absl::Status GPUOperationFromNode(const GpuInfo& gpu_info,
            model_builder->TopK(src, attr.k), {outputs[0]->id, outputs[1]->id});
      }
      case OperationType::TRANSPOSE: {
@@ -59,30 +62,11 @@ index a729d68..60302f2 100644
      }
      default:
        ABSL_ASSIGN_OR_RETURN(auto gpu_op, SelectDefault(gpu_info, op_def, node));
-diff --git a/ml_drift/common/gpu_model_builder.cc b/ml_drift/common/gpu_model_builder.cc
-index 21a5da2..61e5c0e 100644
---- a/ml_drift/common/gpu_model_builder.cc
-+++ b/ml_drift/common/gpu_model_builder.cc
-@@ -3788,8 +3814,12 @@ absl::Status GpuModelBuilder::UpdateOutputTensors(
-     if (new_tensor.tensor_desc.GetBHWDCShape() !=
-         outputs[i].tensor_desc.GetBHWDCShape()) {
-       // Shapes from GraphFloat32 can be calculated differently from
--      // GpuModelBuilder.
--      ABSL_LOG(WARNING)
-+      // GpuModelBuilder. This is an upstream-acknowledged limitation for 5D
-+      // reshape/transpose axis relabeling; the requested shape is still used
-+      // via SetOutputDescriptor() below and execution is unaffected. Demoted
-+      // from WARNING to VLOG(1) to silence a large volume of noise during
-+      // SAM-encoder compile (WebNN route-A).
-+      ABSL_VLOG(1)
-           << "Shape mismatch in GpuModelBuilder::UpdateOutputTensors(output of "
-           << node.name << "). Requested shape:"
-           << ToString(new_tensor.tensor_desc.GetBHWDCShape())
 diff --git a/ml_drift/common/transformations/remove_noop.cc b/ml_drift/common/transformations/remove_noop.cc
-index 3a1b308..834b919 100644
+index 3e6f0da..80c41cb 100644
 --- a/ml_drift/common/transformations/remove_noop.cc
 +++ b/ml_drift/common/transformations/remove_noop.cc
-@@ -109,9 +109,17 @@ class RemoveIdentityReshape : public NodeTransformation {
+@@ -109,9 +109,19 @@ class RemoveIdentityReshape : public NodeTransformation {
        return {TransformStatus::SKIPPED, ""};
      }
      auto input_shape = graph->FindInputs(node->id)[0]->tensor.shape;
@@ -90,11 +74,13 @@ index 3a1b308..834b919 100644
 -        std::any_cast<const ReshapeAttributes&>(node->operation.attributes);
 -    if (input_shape != reshape_attr.new_shape) {
 +    // Handle both 4D (ReshapeAttributes) and 5D (Reshape3DAttributes).
-+    if (auto* attr4d = std::any_cast<ReshapeAttributes>(&node->operation.attributes)) {
++    if (auto* attr4d =
++            std::any_cast<ReshapeAttributes>(&node->operation.attributes)) {
 +      if (input_shape != attr4d->new_shape) {
 +        return {TransformStatus::SKIPPED, ""};
 +      }
-+    } else if (auto* attr5d = std::any_cast<Reshape3DAttributes>(&node->operation.attributes)) {
++    } else if (std::any_cast<Reshape3DAttributes>(
++                   &node->operation.attributes)) {
 +      // For 5D reshape, we can't easily compare with BHWC input_shape.
 +      // A 5D reshape is never a simple identity (the rank changes),
 +      // so just skip.

@@ -1,0 +1,53 @@
+ml-drift: make the WebGPU readback timeout configurable
+
+MapAsync on the readback buffer only completes once every previously
+queued command has executed, so its timeout is really a budget for the
+whole inference rather than for the copy. The hardcoded 10s is not enough
+for a large graph on an integrated GPU: the SAM encoder needs about 11s
+on an Intel UHD 630 and failed with "Timed out waiting for future: 10s",
+which reads like a hang or an OOM rather than a slow device.
+
+Adds MLD_WEBGPU_READBACK_TIMEOUT_SECONDS. Default behaviour is unchanged.
+
+diff --git a/ml_drift/webgpu/webgpu_api_util.cc b/ml_drift/webgpu/webgpu_api_util.cc
+index 14c8782..7da155e 100644
+--- a/ml_drift/webgpu/webgpu_api_util.cc
++++ b/ml_drift/webgpu/webgpu_api_util.cc
+@@ -15,6 +15,7 @@
+ #include "ml_drift/webgpu/webgpu_api_util.h"
+ 
+ #include <cstdint>
++#include <cstdlib>
+ #include <cstring>
+ #include <memory>
+ #include <string>
+@@ -59,6 +60,20 @@ namespace ml_drift {
+ namespace webgpu {
+ namespace {
+ 
++// MapAsync on the readback buffer only completes once every command queued
++// before it has executed, so this timeout is really a budget for the whole
++// inference, not for the copy. Ten seconds is plenty for typical graphs but not
++// for very large ones on an integrated GPU. The override exists so a slow
++// device can be told apart from a wedged one.
++absl::Duration ReadbackTimeout() {
++  static const absl::Duration kTimeout = [] {
++    const char* env = std::getenv("MLD_WEBGPU_READBACK_TIMEOUT_SECONDS");
++    const int seconds = env != nullptr ? std::atoi(env) : 0;
++    return seconds > 0 ? absl::Seconds(seconds) : absl::Seconds(10);
++  }();
++  return kTimeout;
++}
++
+ absl::Status ReadDataFromMappableBuffer(const wgpu::Device& device,
+                                         const wgpu::Queue& queue,
+                                         const wgpu::Buffer& mappable_buffer,
+@@ -76,7 +91,7 @@ absl::Status ReadDataFromMappableBuffer(const wgpu::Device& device,
+             status = s;
+             message = std::string(msg);
+           }),
+-      absl::Seconds(10)));
++      ReadbackTimeout()));
+ 
+   if (status != wgpu::MapAsyncStatus::Success) {
+     return absl::InternalError(message);

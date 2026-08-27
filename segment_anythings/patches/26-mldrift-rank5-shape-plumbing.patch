@@ -1,0 +1,151 @@
+ml-drift: allocate rank-5 graph values with their real shape
+
+GraphFloat32::Value holds a TensorRef<BHWC>, so a frontend with a 5D
+tensor has to drop a dimension to store it. ReserveGraphTensors() then
+allocated e.g. [5,14,5,14,768] as BHWC(5,14,5,14) -- 768x too small --
+and UpdateOutputTensors() overwrote the correct 5D descriptor with the
+truncated one via SetOutputDescriptor(). On the SAM encoder this produced
+100 shape-mismatch warnings and garbage through the whole window-attention
+path.
+
+Adds CreateGpuModelInfo::rank5_shapes, a ValueId -> BHWDC side table that
+frontends able to see the original rank can populate (see the companion
+litert patch). GetTensorDescForValue() then builds a BHWDC/HWDC descriptor
+for those values, mirroring the layout selection already used by
+GpuModelBuilder::AddTensor(b, h, w, d, c, ...).
+
+Also switches the legacy elementwise selector to read shapes from the
+tensor descriptors rather than Value::tensor.shape, which is BHWC and
+therefore truncated; the IR selector already did this. Without it the
+rank-5 broadcast ADDs of SAM's relative-position bias pick the wrong
+broadcast.
+
+The kernels needed no changes -- reshape.cc, transpose.cc and
+elementwise.cc already handle Axis::DEPTH.
+
+diff --git a/ml_drift/common/BUILD b/ml_drift/common/BUILD
+index 22acbd1..5bba3ca 100644
+--- a/ml_drift/common/BUILD
++++ b/ml_drift/common/BUILD
+@@ -75,6 +75,7 @@ cc_library(
+         ":model",
+         ":model_hints",
+         ":precision",
++        ":shape",
+         "//ml_drift/common/task:gpu_operation",
+         "//ml_drift/common/task:gpu_tensor",
+         "//ml_drift/common/task:serialization_base",
+diff --git a/ml_drift/common/gpu_model.h b/ml_drift/common/gpu_model.h
+index b655a1b..9a4b367 100644
+--- a/ml_drift/common/gpu_model.h
++++ b/ml_drift/common/gpu_model.h
+@@ -29,6 +29,7 @@
+ #include "ml_drift/common/model.h"
+ #include "ml_drift/common/model_hints.h"
+ #include "ml_drift/common/precision.h"
++#include "ml_drift/common/shape.h"
+ #include "ml_drift/common/task/gpu_operation.h"
+ #include "ml_drift/common/task/gpu_tensor.h"
+ #include "ml_drift/common/task/tensor_desc.h"
+@@ -110,6 +111,19 @@ struct CreateGpuModelInfo {
+   // IMPORTANT: tensors ids from predefined / external_immutable_tensors /
+   // external_mutable_tensors should not intersect.
+   absl::flat_hash_map<ValueId, TensorDescriptor> external_mutable_tensors;
++
++  // True rank-5 shapes for graph values whose tensors are 5D.
++  //
++  // GraphFloat32::Value stores a TensorRef<BHWC>, so a 5D tensor loses its
++  // last dimension by the time it reaches ReserveGraphTensors(): [5,14,5,14,
++  // 768] arrives as BHWC(5,14,5,14). The GPU tensor would then be allocated
++  // 768x too small and every consumer would read garbage. Frontends that can
++  // still see the original rank (e.g. the TFLite delegate, which has the
++  // TfLiteTensor dims) record the real BHWDC here, and ReserveGraphTensors()
++  // uses it instead of value->tensor.shape.
++  //
++  // Only rank 5 is representable; BHWDC has no room for rank 6+.
++  absl::flat_hash_map<ValueId, BHWDC> rank5_shapes;
+ };
+ 
+ // TODO(sorokin): Remove the same fields from CreateGpuModelInfo.
+diff --git a/ml_drift/common/gpu_model_util.cc b/ml_drift/common/gpu_model_util.cc
+index bd5edc0..1ae4020 100644
+--- a/ml_drift/common/gpu_model_util.cc
++++ b/ml_drift/common/gpu_model_util.cc
+@@ -210,6 +210,32 @@ absl::StatusOr<TensorDescriptor> GetTensorDescForValue(
+     }
+   }
+ 
++  // For a rank-5 value, value->tensor.shape is a truncated BHWC (the frontend
++  // dropped the last dimension to fit TensorRef<BHWC>), so build the
++  // descriptor from the real shape instead. Mirrors the layout selection in
++  // GpuModelBuilder::AddTensor(b, h, w, d, c, ...).
++  if (auto it = create_info.rank5_shapes.find(value->id);
++      it != create_info.rank5_shapes.end()) {
++    const BHWDC& shape_5d = it->second;
++    const bool has_b = shape_5d.b > 1;
++    const bool has_d = shape_5d.d > 1;
++    Layout layout_5d;
++    if (has_b && has_d) {
++      layout_5d = Layout::BHWDC;
++    } else if (has_b) {
++      layout_5d = Layout::BHWC;
++    } else if (has_d) {
++      layout_5d = Layout::HWDC;
++    } else {
++      layout_5d = Layout::HWC;
++    }
++    auto tensor_desc =
++        TensorDescriptor{data_type, create_info.storage_type, layout_5d};
++    ABSL_RETURN_IF_ERROR(
++        tensor_desc.UpdateToSupportedStorageType(gpu_info, shape_5d));
++    return tensor_desc;
++  }
++
+   // Initialize the tensor storage type.
+   const auto shape = value->tensor.shape;
+   Layout layout = shape.b == 1 ? Layout::HWC : Layout::BHWC;
+@@ -270,7 +296,12 @@ absl::Status ReserveGraphTensors(const CreateGpuModelInfo& create_info,
+     ABSL_ASSIGN_OR_RETURN(auto tensor_desc,
+                           GetTensorDescForValue(create_info, gpu_info, graph,
+                                                 cast_graph_outputs, value));
+-    tensor_desc.SetBHWCShape(value->tensor.shape);
++    if (auto it = create_info.rank5_shapes.find(value->id);
++        it != create_info.rank5_shapes.end()) {
++      tensor_desc.SetBHWDCShape(it->second);
++    } else {
++      tensor_desc.SetBHWCShape(value->tensor.shape);
++    }
+     tensor_reserver->Add(value->id, tensor_desc);
+     max_id = std::max(max_id, value->id);
+   }
+diff --git a/ml_drift/common/selectors/operation_selector.cc b/ml_drift/common/selectors/operation_selector.cc
+index c640580..6bd60e7 100644
+--- a/ml_drift/common/selectors/operation_selector.cc
++++ b/ml_drift/common/selectors/operation_selector.cc
+@@ -633,14 +633,21 @@ absl::Status GPUOperationFromNode(const GpuInfo& gpu_info,
+           attr = std::any_cast<const ElementwiseAttributes&>(
+               node.operation.attributes);
+         }
+-        if (inputs[0]->tensor.shape != outputs[0]->tensor.shape) {
++        // Take the shapes from the tensor descriptors rather than from
++        // Value::tensor.shape: the latter is a BHWC and is therefore truncated
++        // for rank-5 values, which would select the wrong broadcast. The
++        // descriptors carry the real BHWDC (see CreateGpuModelInfo::
++        // rank5_shapes). This matches what the IR selector below already does.
++        const BHWDC& first_shape = op_def.src_tensors[0].GetBHWDCShape();
++        const BHWDC& second_shape = op_def.src_tensors[1].GetBHWDCShape();
++        const BHWDC& dst_shape = op_def.dst_tensors[0].GetBHWDCShape();
++        if (first_shape != dst_shape) {
+           operation = CreateElementwiseTwoInputWithBroadcast(
+-              gpu_info, op_def, op_type, inputs[0]->tensor.shape,
+-              inputs[1]->tensor.shape, outputs[0]->tensor.shape, attr);
++              gpu_info, op_def, op_type, first_shape, second_shape, dst_shape,
++              attr);
+         } else {
+           operation = CreateElementwiseTwoInput(gpu_info, op_def, op_type,
+-                                                inputs[1]->tensor.shape,
+-                                                outputs[0]->tensor.shape);
++                                                second_shape, dst_shape);
+         }
+       } else if (inputs.size() == 1 && node.operation.attributes.has_value()) {
+         const auto& attr = std::any_cast<const ElementwiseAttributes&>(
