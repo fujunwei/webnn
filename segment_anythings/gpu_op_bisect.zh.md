@@ -766,7 +766,37 @@ C:\Users\fujun\workspace\chromium\src\out\Release\chrome.exe `
 ```
 
 - `--ignore-certificate-errors`：`https://<IP>` 的证书必然不匹配，不加进不去。
-  WebNN 要 secure context，所以**不能**降级成 http。
+  这个 flag 是存在的，定义在
+  `components/network_session_configurator/common/network_switch_list.h:34`
+  （用 X-macro 生成，所以直接 grep 字符串 `"ignore-certificate-errors"`
+  在 `net/`、`services/network/` 里都搜不到，别被误导）。
+  `content_shell` 也认它（`content/shell/browser/shell_browser_context.cc:72`）。
+
+  WebNN 要 secure context，所以**不能**把远端 `https://<IP>` 降级成 http。
+  但 `http://localhost:<port>` 属于 potentially trustworthy origin，**本身就是
+  secure context**（`services/network/public/cpp/is_potentially_trustworthy_unittest.h:216`），
+  所以把 demo 放到本机用 http 提供是完全可行的，而且能绕开证书和代理两个坑。
+
+### 13.4.1 `content_shell` 上不了外网（2026-08-28）
+
+用 `content_shell.exe` 打开外网页面（如 `www.baidu.com`）会失败，**这不是证书
+配置问题，是 content_shell 根本不走代理**：
+
+- `ShellContentBrowserClient::ConfigureNetworkContextParamsForShell()` 只设了
+  user_agent / accept_language / zstd 等，**没有设 `initial_proxy_config`，
+  也没有设 `proxy_config_client_receiver`**；
+- 于是 `services/network/network_context.cc:3098` 兜底成
+  `net::ProxyConfigWithAnnotation::CreateDirect()` —— 直连；
+- 本机直连是被挡的（`Test-NetConnection www.baidu.com -Port 443` →
+  `TcpTestSucceeded: False`），系统代理是 `http://proxy-ir.intel.com:911`。
+
+**`--proxy-server` 救不了**：`services/network/` 和
+`components/network_session_configurator/` 里都没有读这个 flag，它是在
+`chrome/browser` 里被消费的，而 content_shell 没有那一层。
+
+所以：**要联网就用 `chrome.exe`**（它有完整代理支持，实测能通过代理访问外网）；
+要用 `content_shell` 就把页面放到 `http://localhost:<port>`（localhost 在
+`NO_PROXY` 里，直连可达，且是 secure context）。
 - **dump 到一个新的空目录**（`run0\`）。`D:\tflite-dump-model` 根目录里现在躺着
   8 月 4 日和 8 月 12 日的两份旧 encoder dump，混在一起会认错模型。
 

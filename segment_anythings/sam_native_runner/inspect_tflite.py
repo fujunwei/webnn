@@ -101,7 +101,10 @@ def main(path):
     for i in range(n_ops):
         oc = model.vec_table(1, i)
         bc = oc.scalar(0, "<b") if oc.has(0) else None
-        dbc = oc.scalar(3, "<b") if oc.has(3) else None
+        # builtin_code (field 3) is int32 in the schema, unlike the legacy
+        # deprecated_builtin_code (field 0, int8) -- codes >127 only fit in
+        # the int32 field.
+        dbc = oc.scalar(3, "<i") if oc.has(3) else None
         builtins.append(bc if dbc is None else dbc)
     print("operator_codes (builtin):", builtins)
 
