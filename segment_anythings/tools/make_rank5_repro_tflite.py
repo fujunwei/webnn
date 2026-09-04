@@ -36,14 +36,20 @@ import numpy as np
 # schema_v3 enum values.
 BUILTIN_ADD = 0
 BUILTIN_DEQUANTIZE = 6
+BUILTIN_MUL = 18
 BUILTIN_RESHAPE = 22
+BUILTIN_SOFTMAX = 25
 BUILTIN_CUSTOM = 32
 BUILTIN_TRANSPOSE = 39
 BUILTIN_POW = 78
+BUILTIN_BATCH_MATMUL = 126
 OPT_NONE = 0
+OPT_SOFTMAX = 9      # BuiltinOptions_SoftmaxOptions
 OPT_ADD = 11         # BuiltinOptions_AddOptions
 OPT_RESHAPE = 17     # BuiltinOptions_ReshapeOptions
+OPT_MUL = 21         # BuiltinOptions_MulOptions
 OPT_TRANSPOSE = 26   # BuiltinOptions_TransposeOptions
+OPT_BATCH_MATMUL = 101  # BuiltinOptions_BatchMatMulOptions
 TYPE_FLOAT32 = 0
 TYPE_FLOAT16 = 1
 TYPE_INT32 = 2
@@ -117,6 +123,23 @@ class ModelWriter:
     def add(self, a, b_, out_shape, name):
         dst = self.tensor(out_shape, name)
         self.ops.append((BUILTIN_ADD, [a, b_], [dst], OPT_ADD, None, None))
+        return dst
+
+    def mul(self, a, b_, out_shape, name):
+        dst = self.tensor(out_shape, name)
+        self.ops.append((BUILTIN_MUL, [a, b_], [dst], OPT_MUL, None, None))
+        return dst
+
+    def softmax(self, src, out_shape, name, beta=1.0):
+        dst = self.tensor(out_shape, name)
+        self.ops.append((BUILTIN_SOFTMAX, [src], [dst], OPT_SOFTMAX, beta,
+                         None))
+        return dst
+
+    def batch_matmul(self, a, b_, out_shape, name):
+        dst = self.tensor(out_shape, name)
+        self.ops.append((BUILTIN_BATCH_MATMUL, [a, b_], [dst],
+                         OPT_BATCH_MATMUL, None, None))
         return dst
 
     def dequantize(self, src, shape, name):
@@ -200,7 +223,15 @@ class ModelWriter:
                 b.StartObject(2)
                 b.PrependInt8Slot(0, 0, 0)  # fused_activation_function = NONE
                 opt_off = b.EndObject()
-            else:  # TransposeOptions is an empty table
+            elif opt_kind == OPT_MUL:
+                b.StartObject(1)
+                b.PrependInt8Slot(0, 0, 0)  # fused_activation_function = NONE
+                opt_off = b.EndObject()
+            elif opt_kind == OPT_SOFTMAX:
+                b.StartObject(1)
+                b.PrependFloat32Slot(0, opt_arg, 0.0)  # beta
+                opt_off = b.EndObject()
+            else:  # TransposeOptions / BatchMatMulOptions are empty here
                 b.StartObject(0)
                 opt_off = b.EndObject()
             custom_off = None
@@ -372,6 +403,105 @@ def build_layernorm():
     return m.serialize([x], [out]), (1, 4, 4, 8)
 
 
+def build_softmax_attn():
+    """mul(scale) -> softmax -> matmul(V), the decomposed SDPA pattern.
+
+    Isolates whether the *standalone* fp16 Mul/Softmax/BatchMatMul kernels
+    (the ones actually used when a model's attention block isn't recognized
+    as an odml.scaled_dot_product_attention composite -- see
+    sd/MLDRIFT_SOFTMAX_BUG_REPORT_ANALYSIS.md sec 9) reproduce the ~37x
+    GPU-vs-CPU divergence seen on vae_decoder_f16.tflite. Reduction axis is
+    1024 wide to match the >=1024 threshold real attention blocks hit.
+
+        x    : [1, 4, 1024]                  (raw scores, input)
+        s    = mul(x, scale_const)           scale_const: scalar 0.125
+        p    = softmax(s, axis=-1)           reduces over 1024
+        v    : [1, 1024, 32]                 constant "value" matrix
+        out  = batch_matmul(p, v)            -> [1, 4, 32]
+    """
+    rows, k_dim, v_dim = 4, 1024, 32
+    m = ModelWriter()
+    x = m.tensor([1, rows, k_dim], "x")
+    scale = m.tensor([1], "scale", TYPE_FLOAT32,
+                     np.asarray([0.125], np.float32))
+    s = m.mul(x, scale, [1, rows, k_dim], "scaled_scores")
+    p = m.softmax(s, [1, rows, k_dim], "probs")
+    v = m.tensor([1, k_dim, v_dim], "v", TYPE_FLOAT32,
+                (np.arange(k_dim * v_dim, dtype=np.float32) % 23.0 - 11.0)
+                .reshape(1, k_dim, v_dim))
+    out = m.batch_matmul(p, v, [1, rows, v_dim], "out")
+    return m.serialize([x], [out]), (1, rows, k_dim)
+
+
+def build_softmax_attn_vae():
+    """Same mul->softmax->matmul pattern as build_softmax_attn(), but sized
+    and scaled to match the *actual* self-attention block found at op index
+    120 of sd/vae_decoder_f16.tflite (see
+    segment_anythings/tools/find_op_pattern.py sd/vae_decoder_f16.tflite
+    MUL,SOFTMAX,BATCH_MATMUL):
+
+        op[120] MUL    in=[#169 [1,4096,4096], #171 [] (dequantized fp16
+                            scalar 0.044189453125 == 1/sqrt(512))]
+        op[121] SOFTMAX in=[#172 [1,4096,4096]]
+        op[122] BATCH_MATMUL in=[#173 [1,4096,4096], #152 [1,4096,512]]
+
+    i.e. single-head self-attention over a 64x64=4096-token spatial map with
+    512 channels. #169 (raw QK^T scores) and #152 (V) are runtime activations
+    in the real model; here both are simple inputs/constants since only the
+    Mul/Softmax/BatchMatMul kernel chain is under test, not the preceding
+    QK^T matmul.
+
+        x    : [1, 4096, 4096]               (raw scores, input)
+        s    = mul(x, scale_const)           scale_const: fp16 0.044189453125
+                                              (exact bits copied from #170)
+        p    = softmax(s, axis=-1)           reduces over 4096
+        v    : [1, 4096, 512]                constant "value" matrix
+        out  = batch_matmul(p, v)            -> [1, 4096, 512]
+    """
+    rows, k_dim, v_dim = 4096, 4096, 512
+    m = ModelWriter()
+    x = m.tensor([1, rows, k_dim], "x")
+    scale = m.tensor([], "scale_f16", TYPE_FLOAT16,
+                     np.asarray(0.044189453125, np.float16))
+    scale_f32 = m.dequantize(scale, [], "scale_f32")
+    s = m.mul(x, scale_f32, [1, rows, k_dim], "scaled_scores")
+    p = m.softmax(s, [1, rows, k_dim], "probs")
+    v = m.tensor([1, k_dim, v_dim], "v", TYPE_FLOAT32,
+                (np.arange(k_dim * v_dim, dtype=np.float32) % 23.0 - 11.0)
+                .reshape(1, k_dim, v_dim))
+    out = m.batch_matmul(p, v, [1, rows, v_dim], "out")
+    return m.serialize([x], [out]), (1, rows, k_dim)
+
+
+def build_softmax_attn_vae_fp16in():
+    """Same as build_softmax_attn_vae(), but the graph's own INPUT tensor
+    (the raw QK^T scores "x") is declared TYPE_FLOAT16 (dequantized to fp32
+    immediately, mirroring how the real model's scale constant reaches the
+    graph -- see build_softmax_attn_vae()'s docstring), instead of FLOAT32.
+
+    The real vae_decoder_f16.tflite declares even its own graph input as
+    FLOAT32 (see find_op_pattern.py output on tensor #0 "latent_sample") --
+    only the scale constant is a true fp16 buffer. This variant exists to
+    empirically check whether declaring the activation path itself as fp16
+    (rather than relying solely on --precision=fp16's global calculation
+    policy) changes anything on the GPU delegate.
+    """
+    rows, k_dim, v_dim = 4096, 4096, 512
+    m = ModelWriter()
+    x16 = m.tensor([1, rows, k_dim], "x_f16", TYPE_FLOAT16)
+    x = m.dequantize(x16, [1, rows, k_dim], "x_f32")
+    scale = m.tensor([], "scale_f16", TYPE_FLOAT16,
+                     np.asarray(0.044189453125, np.float16))
+    scale_f32 = m.dequantize(scale, [], "scale_f32")
+    s = m.mul(x, scale_f32, [1, rows, k_dim], "scaled_scores")
+    p = m.softmax(s, [1, rows, k_dim], "probs")
+    v = m.tensor([1, k_dim, v_dim], "v", TYPE_FLOAT32,
+                (np.arange(k_dim * v_dim, dtype=np.float32) % 23.0 - 11.0)
+                .reshape(1, k_dim, v_dim))
+    out = m.batch_matmul(p, v, [1, rows, v_dim], "out")
+    return m.serialize([x16], [out]), (1, rows, k_dim)
+
+
 def main(*argv):
     argv = list(argv)
     rank4 = "--rank4" in argv
@@ -379,12 +509,22 @@ def main(*argv):
     transpose2d = "--transpose2d" in argv
     bcast5d = "--bcast5d" in argv
     layernorm = "--layernorm" in argv
+    softmax_attn = "--softmax-attn" in argv
+    softmax_attn_vae = "--softmax-attn-vae" in argv
+    softmax_attn_vae_fp16in = "--softmax-attn-vae-fp16in" in argv
     for flag in ("--rank4", "--pow-neg", "--transpose2d", "--bcast5d",
-                 "--layernorm"):
+                 "--layernorm", "--softmax-attn", "--softmax-attn-vae",
+                 "--softmax-attn-vae-fp16in"):
         if flag in argv:
             argv.remove(flag)
     model_path, input_path = argv[0], (argv[1] if len(argv) > 1 else None)
-    if layernorm:
+    if softmax_attn_vae_fp16in:
+        blob, in_shape = build_softmax_attn_vae_fp16in()
+    elif softmax_attn_vae:
+        blob, in_shape = build_softmax_attn_vae()
+    elif softmax_attn:
+        blob, in_shape = build_softmax_attn()
+    elif layernorm:
         blob, in_shape = build_layernorm()
     elif bcast5d:
         blob, in_shape = build_bcast5d()

@@ -1,0 +1,285 @@
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>webnn-sdpa PENDING</title>
+<style>
+  body { font-family: Consolas, monospace; font-size: 13px; }
+  pre { white-space: pre-wrap; }
+  .ok { color: #0a0; } .bad { color: #c00; font-weight: bold; }
+  .hd { font-weight: bold; }
+</style>
+</head>
+<body>
+<h3>WebNN decomposed-SDPA fusion test</h3>
+<p>Builds <code>Transpose(K) &rarr; Matmul(Q,K&#7488;) &rarr; Mul(scale) &rarr; Softmax &rarr; Matmul(&middot;,V)</code>
+&mdash; the exact pattern <code>TryFuseScaledDotProductAttention</code> matches &mdash; and compares
+CPU vs GPU vs a JS reference.</p>
+<p>Variants: <code>raw</code> feeds Q/K/V straight from graph inputs;
+<code>proj</code> derives them from one input via constant-weight matmul projections
+(like the real SD VAE decoder attention block) and adds a <code>proj_out</code> matmul.</p>
+<p>Run Chrome with<br>
+<code>--no-sandbox --enable-logging=stderr --v=0
+--enable-features=WebMachineLearningNeuralNetwork
+--disable-features=WebNNDirectML,WebNNOnnxRuntime
+--webnn-tflite-dump-model=&lt;dir&gt; --user-data-dir=&lt;dir&gt;</code><br>
+Control run: append <code>,ApplySdpaFusion</code> to <code>--disable-features</code>.</p>
+<pre id="out">PENDING</pre>
+<script>
+const out = document.getElementById('out');
+function log(m, cls) {
+  const span = document.createElement('span');
+  if (cls) span.className = cls;
+  span.textContent = m + "\n";
+  out.appendChild(span);
+  console.log("[WEBNN-SDPA] " + m);
+}
+
+// Deterministic pseudo-random so CPU/GPU/JS all see identical inputs and
+// results are comparable across runs and across Chrome invocations.
+function seededFill(n, seed, amp) {
+  const a = new Float32Array(n);
+  let s = seed >>> 0;
+  for (let i = 0; i < n; ++i) {
+    s = (s * 1664525 + 1013904223) >>> 0;
+    a[i] = (((s >>> 8) / 8388608.0) - 1.0) * (amp === undefined ? 1 : amp);
+  }
+  return a;
+}
+
+function stats(a) {
+  let mn = Infinity, mx = -Infinity, sum = 0, nan = 0;
+  for (let i = 0; i < a.length; ++i) {
+    const v = a[i];
+    if (!Number.isFinite(v)) { nan++; continue; }
+    if (v < mn) mn = v;
+    if (v > mx) mx = v;
+    sum += v;
+  }
+  const mean = sum / (a.length - nan);
+  let vsum = 0;
+  for (let i = 0; i < a.length; ++i) {
+    const v = a[i];
+    if (Number.isFinite(v)) vsum += (v - mean) * (v - mean);
+  }
+  return { min: mn, max: mx, mean: mean,
+           std: Math.sqrt(vsum / (a.length - nan)), nan: nan };
+}
+const fmtStats = (s) => `min=${s.min.toFixed(6)} max=${s.max.toFixed(6)} ` +
+                        `mean=${s.mean.toFixed(6)} std=${s.std.toFixed(6)} nan=${s.nan}`;
+
+function compare(a, b, tol) {
+  let maxAbs = 0, sumAbs = 0, over = 0, nanMismatch = 0;
+  for (let i = 0; i < a.length; ++i) {
+    const fa = Number.isFinite(a[i]), fb = Number.isFinite(b[i]);
+    if (fa !== fb) { nanMismatch++; continue; }
+    if (!fa) continue;
+    const d = Math.abs(a[i] - b[i]);
+    if (d > maxAbs) maxAbs = d;
+    sumAbs += d;
+    if (d > tol) over++;
+  }
+  return { maxAbs, meanAbs: sumAbs / a.length, over, nanMismatch, n: a.length };
+}
+
+// ---- JS reference, all in fp32 ----
+// mat: [M,K] x [K,N] -> [M,N], row-major.
+function matmul(a, b, M, K, N) {
+  const o = new Float32Array(M * N);
+  for (let i = 0; i < M; ++i) {
+    for (let k = 0; k < K; ++k) {
+      const av = a[i * K + k];
+      if (av === 0) continue;
+      const bo = k * N, oo = i * N;
+      for (let j = 0; j < N; ++j) o[oo + j] += av * b[bo + j];
+    }
+  }
+  return o;
+}
+
+// Single-head attention on [S, C] row-major buffers.
+function refAttention(q, k, v, S, C, scale) {
+  const o = new Float32Array(S * C);
+  const row = new Float32Array(S);
+  for (let i = 0; i < S; ++i) {
+    let mx = -Infinity;
+    for (let j = 0; j < S; ++j) {
+      let d = 0;
+      for (let c = 0; c < C; ++c) d += q[i * C + c] * k[j * C + c];
+      d *= scale;
+      row[j] = d;
+      if (d > mx) mx = d;
+    }
+    let sum = 0;
+    for (let j = 0; j < S; ++j) { row[j] = Math.exp(row[j] - mx); sum += row[j]; }
+    for (let j = 0; j < S; ++j) row[j] /= sum;
+    for (let c = 0; c < C; ++c) {
+      let acc = 0;
+      for (let j = 0; j < S; ++j) acc += row[j] * v[j * C + c];
+      o[i * C + c] = acc;
+    }
+  }
+  return o;
+}
+
+// ---- Weight/input sets shared by the graph and the JS reference ----
+function makeCaseData(c) {
+  const { S, C, projected } = c;
+  const d = { scale: 1.0 / Math.sqrt(C) };
+  if (projected) {
+    // Keep the projection weights small so fp16 activations stay in range.
+    d.x  = seededFill(S * C, 0x1111);
+    d.wq = seededFill(C * C, 0x2222, 1 / Math.sqrt(C));
+    d.wk = seededFill(C * C, 0x3333, 1 / Math.sqrt(C));
+    d.wv = seededFill(C * C, 0x4444, 1 / Math.sqrt(C));
+    d.wo = seededFill(C * C, 0x5555, 1 / Math.sqrt(C));
+  } else {
+    d.q = seededFill(S * C, 0x1234);
+    d.k = seededFill(S * C, 0x5678);
+    d.v = seededFill(S * C, 0x9abc);
+  }
+  return d;
+}
+
+function refCase(c, d) {
+  const { S, C, projected } = c;
+  if (!projected) return refAttention(d.q, d.k, d.v, S, C, d.scale);
+  const q = matmul(d.x, d.wq, S, C, C);
+  const k = matmul(d.x, d.wk, S, C, C);
+  const v = matmul(d.x, d.wv, S, C, C);
+  const att = refAttention(q, k, v, S, C, d.scale);
+  return matmul(att, d.wo, S, C, C);
+}
+
+// ---- Build + run the decomposed-SDPA graph on one context ----
+function toDtype(f32, dtype) {
+  if (dtype === 'float32') return f32;
+  return new Float16Array(f32);  // guarded by the caller
+}
+
+async function runOnContext(deviceType, c, d) {
+  const { S, C, dtype, projected } = c;
+  const ctx = await navigator.ml.createContext({ deviceType });
+  const b = new MLGraphBuilder(ctx);
+  const actDesc = { dataType: dtype, shape: [1, S, C] };
+  const wDesc = { dataType: dtype, shape: [1, C, C] };
+  const konst = (desc, f32) => b.constant(desc, toDtype(f32, dtype));
+
+  const inputs = {}, tensors = {};
+  let q, k, v;
+  if (projected) {
+    const x = b.input('x', actDesc);
+    inputs.x = d.x;
+    q = b.matmul(x, konst(wDesc, d.wq));
+    k = b.matmul(x, konst(wDesc, d.wk));
+    v = b.matmul(x, konst(wDesc, d.wv));
+  } else {
+    q = b.input('q', actDesc); inputs.q = d.q;
+    k = b.input('k', actDesc); inputs.k = d.k;
+    v = b.input('v', actDesc); inputs.v = d.v;
+  }
+
+  // The exact op sequence the fusion pass anchors on.
+  const kT = b.transpose(k, { permutation: [0, 2, 1] });      // [1, C, S]
+  let s = b.matmul(q, kT);                                     // [1, S, S]
+  s = b.mul(s, konst({ dataType: dtype, shape: [1] },
+                     new Float32Array([d.scale])));
+  s = b.softmax(s, 2);
+  let o = b.matmul(s, v);                                      // [1, S, C]
+  if (projected) o = b.matmul(o, konst(wDesc, d.wo));
+
+  const graph = await b.build({ o });
+
+  const named = {};
+  for (const [name, data] of Object.entries(inputs)) {
+    const t = await ctx.createTensor({ ...actDesc, writable: true });
+    ctx.writeTensor(t, toDtype(data, dtype));
+    named[name] = t;
+  }
+  const oT = await ctx.createTensor({ ...actDesc, readable: true });
+  ctx.dispatch(graph, named, { o: oT });
+  const raw = await ctx.readTensor(oT);
+  const res = new Float32Array(
+      dtype === 'float32' ? new Float32Array(raw) : new Float16Array(raw));
+  const devices = graph.devices ? JSON.stringify(graph.devices) : "n/a";
+  if (ctx.destroy) ctx.destroy();
+  return { res, devices };
+}
+
+// Real VAE-decoder attention block is S=64*64=4096, C=512. The JS reference is
+// O(S^2*C) so it is only computed for the small shapes.
+const hasF16 = typeof Float16Array !== 'undefined';
+const CASES = [];
+for (const dtype of hasF16 ? ['float32', 'float16'] : ['float32']) {
+  for (const projected of [false, true]) {
+    CASES.push({ S: 8,    C: 16,  ref: true,  dtype, projected });
+    CASES.push({ S: 256,  C: 128, ref: true,  dtype, projected });
+    // The real SD VAE decoder shape.
+    CASES.push({ S: 4096, C: 512, ref: false, dtype, projected });
+  }
+}
+// fp16 accumulates over S=4096 terms, so the reference tolerance must scale.
+const tolFor = (c) => c.dtype === 'float16' ? 2e-2 : 1e-2;
+
+async function run() {
+  out.textContent = "";
+  log(`navigator.ml=${!!navigator.ml} Float16Array=${hasF16}`);
+  const summary = [];
+  let anyFail = false;
+
+  for (const c of CASES) {
+    const tag = `${c.dtype} ${c.projected ? 'proj' : 'raw '} S=${c.S} C=${c.C}`;
+    log("");
+    log(`=== ${tag} scale=${(1 / Math.sqrt(c.C)).toFixed(8)} ` +
+        `tol=${tolFor(c)} ===`, 'hd');
+
+    const d = makeCaseData(c);
+    let ref = null;
+    if (c.ref) {
+      const t0 = performance.now();
+      ref = refCase(c, d);
+      log(`  [js-ref] ${fmtStats(stats(ref))} (${(performance.now() - t0).toFixed(0)}ms)`);
+    } else {
+      log(`  [js-ref] skipped (O(S^2*C) too slow)`);
+    }
+
+    const results = {};
+    for (const dev of ['cpu', 'gpu']) {
+      try {
+        const t0 = performance.now();
+        const r = await runOnContext(dev, c, d);
+        results[dev] = r.res;
+        log(`  [${dev}] devices=${r.devices} ${fmtStats(stats(r.res))} ` +
+            `(${(performance.now() - t0).toFixed(0)}ms)`);
+      } catch (e) {
+        log(`  [${dev}] EXCEPTION: ${(e && e.message) || e}`, 'bad');
+        anyFail = true;
+        summary.push(`${tag} [${dev}] EXCEPTION`);
+      }
+    }
+
+    const check = (label, a, bb) => {
+      const dd = compare(a, bb, tolFor(c));
+      const ok = dd.over === 0 && dd.nanMismatch === 0;
+      if (!ok) { anyFail = true; summary.push(`${tag} [${label}] FAIL`); }
+      log(`  [${label}] max_abs=${dd.maxAbs.toExponential(3)} ` +
+          `mean_abs=${dd.meanAbs.toExponential(3)} over_tol=${dd.over}/${dd.n} ` +
+          `nan_mismatch=${dd.nanMismatch} -> ${ok ? 'PASS' : 'FAIL'}`,
+          ok ? 'ok' : 'bad');
+    };
+    for (const dev of ['cpu', 'gpu']) {
+      if (results[dev] && ref) check(`${dev} vs js-ref`, ref, results[dev]);
+    }
+    if (results.cpu && results.gpu) check('cpu vs gpu', results.cpu, results.gpu);
+  }
+
+  log("");
+  if (summary.length) {
+    log("FAILURES:", 'bad');
+    for (const s of summary) log("  " + s, 'bad');
+  }
+  log(anyFail ? "OVERALL: FAIL" : "OVERALL: PASS", anyFail ? 'bad' : 'ok');
+  document.title = "webnn-sdpa " + (anyFail ? "FAIL" : "PASS");
+}
+run();
+</script>
+</body>
+</html>

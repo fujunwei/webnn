@@ -1,0 +1,215 @@
+From c62793f640854f53f278f1a7861972a3e9e03394 Mon Sep 17 00:00:00 2001
+From: Ningxin Hu <ningxin.hu@intel.com>
+Date: Wed, 2 Sep 2026 02:32:50 +0800
+Subject: [PATCH] webnn: Use custom op GroupNorm for instanceNormalization in
+ TFLite graph builder
+
+Implements instance normalization as the fused `custom_call.GroupNorm` custom
+operator for the ML Drift WebGPU delegate, falling back to the existing
+primitive emulation when the preconditions do not hold. This is the counterpart
+of the layer normalization support added in
+https://chromium-review.googlesource.com/c/chromium/src/+/8251142 and reuses the
+plumbing landed there.
+
+This is a correctness fix as well as an optimisation. On a float16 graph the
+delegate runs at fp16 precision, and the primitive decomposition materialises
+`sub -> square -> reduceMean` in fp16 while computing variance. Stable Diffusion
+VAE activations square to ~1e4-1e5 per element, so the reduction saturates
+fp16's 65504, variance becomes Inf, 1/sqrt(Inf) is 0, and the model emits a
+black image with no error and no failed operator. The fused kernel is unaffected
+because ml_drift's MeanStdDevNormalization accumulates mean and variance in a
+float accumulator rather than through fp16 tensors.
+
+Measured on Stable Diffusion 1.5, seed 123465, Intel Arc A770, all runs fully
+delegated with zero delegate rejections:
+
+  fp16 instance norm, fused      UNet 24.7s  VAE 13.3s  correct
+  fp16 instance norm, unfused    UNet 10.3s  VAE  4.3s  black
+  fp32 instance norm, unfused    UNet 41.2s  VAE 38.8s  correct
+
+Instance normalization is group normalization with one channel per group, so
+`num_groups` is set to the channel count and the delegate's existing
+`custom_call.GroupNorm` parser handles it with no change. The attribute
+flexbuffer carries `num_groups` and `epsilon`; both are always written, because
+the parser silently falls back to groups = 32, epsilon = 1e-6 when the buffer is
+absent, which for a 4-channel tensor is a group size of zero.
+
+The fused path is taken only when every precondition holds: the context targets
+the GPU, the input is 4-D and float, the context layout is NHWC, and any scale
+and bias are 1-D constants of exactly the channel count. Each mirrors a
+requirement of the delegate's parser, so bailing here is preferable to being
+rejected there -- a rejected operator splits the delegated partition, which is
+worse than never having emitted the custom op. A bias without a scale is
+deliberately excluded: the parser reads its inputs positionally, so a lone bias
+would be read as the scale.
+
+Verified against a float64 JavaScript reference across seven shape and parameter
+combinations, and on a real model by dumping the serialized graph of the SD
+Turbo VAE decoder, which contains 30 fused `custom_call.GroupNorm` operators
+each carrying its own attribute flexbuffer.
+
+Bug: 534973528
+---
+ services/webnn/tflite/graph_builder_tflite.cc | 121 ++++++++++++++++++
+ services/webnn/tflite/graph_builder_tflite.h  |   6 +
+ 2 files changed, 127 insertions(+)
+
+diff --git a/services/webnn/tflite/graph_builder_tflite.cc b/services/webnn/tflite/graph_builder_tflite.cc
+index 4dd7f18f6d0f6..0263bbba683b6 100644
+--- a/services/webnn/tflite/graph_builder_tflite.cc
++++ b/services/webnn/tflite/graph_builder_tflite.cc
+@@ -7514,6 +7514,116 @@ auto GraphBuilderTflite::SerializeIdentityOperation(
+   return SerializeReshapeOperation(input_tensor_index, output_tensor_index,
+                                    shape);
+ }
++auto GraphBuilderTflite::SerializeInstanceNormalizationAsCustomCall(
++    const mojom::InstanceNormalization& instance_normalization)
++    -> std::optional<OperatorOffset> {
++  // Gate: the fused kernel is only registered by LiteRT when the ML Drift
++  // WebGPU accelerator is selected (`compiled_model.cc` adds
++  // "custom_call.GroupNorm" only under `kLiteRtHwAcceleratorGpu`).
++  if (context_device_ != mojom::Device::kGpu) {
++    return std::nullopt;
++  }
++
++  const mojom::Operand& input_operand =
++      GetOperand(instance_normalization.input_operand_id);
++  const auto& input_shape = input_operand.descriptor.shape();
++  const OperandDataType input_dtype = input_operand.descriptor.data_type();
++
++  // ML Drift's group-norm kernel is strictly 4-D BHWC and float.
++  if (input_shape.size() != 4) {
++    return std::nullopt;
++  }
++  if (input_dtype != OperandDataType::kFloat32 &&
++      input_dtype != OperandDataType::kFloat16) {
++    return std::nullopt;
++  }
++  // Chromium serializes instance norm as NHWC, so channels are the last axis.
++  // Anything else would make `num_groups` refer to the wrong dimension.
++  if (context_properties_.input_operand_layout != InputOperandLayout::kNhwc) {
++    return std::nullopt;
++  }
++  const uint32_t channels = input_shape[3];
++  if (channels == 0) {
++    return std::nullopt;
++  }
++
++  // GroupNormParser reads inputs [x, gamma, beta] positionally and checks that
++  // each is 1-D of exactly `channels`. A bias without a scale would be read as
++  // the scale, so bail on that shape.
++  if (instance_normalization.bias_operand_id &&
++      !instance_normalization.scale_operand_id) {
++    return std::nullopt;
++  }
++  auto is_valid_param = [&](OperandId operand_id) -> bool {
++    const mojom::Operand& op = GetOperand(operand_id);
++    if (op.kind != mojom::Operand::Kind::kConstant) {
++      return false;
++    }
++    if (op.descriptor.data_type() != OperandDataType::kFloat32 &&
++        op.descriptor.data_type() != OperandDataType::kFloat16) {
++      return false;
++    }
++    const auto& s = op.descriptor.shape();
++    return s.size() == 1 && s[0] == channels;
++  };
++  if (instance_normalization.scale_operand_id &&
++      !is_valid_param(*instance_normalization.scale_operand_id)) {
++    return std::nullopt;
++  }
++  if (instance_normalization.bias_operand_id &&
++      !is_valid_param(*instance_normalization.bias_operand_id)) {
++    return std::nullopt;
++  }
++
++  // All preconditions satisfied -- emit the custom op.
++  ASSIGN_OR_RETURN(
++      const TensorInfo& input_tensor_info,
++      SerializeInputTensorInfo(instance_normalization.input_operand_id),
++      [](auto) { return std::nullopt; });
++  std::vector<TensorIndex> op_inputs;
++  op_inputs.reserve(3);
++  op_inputs.push_back(input_tensor_info.index);
++  if (instance_normalization.scale_operand_id) {
++    ASSIGN_OR_RETURN(
++        const TensorInfo& scale_tensor_info,
++        SerializeInputTensorInfo(*instance_normalization.scale_operand_id),
++        [](auto) { return std::nullopt; });
++    op_inputs.push_back(scale_tensor_info.index);
++  }
++  if (instance_normalization.bias_operand_id) {
++    ASSIGN_OR_RETURN(
++        const TensorInfo& bias_tensor_info,
++        SerializeInputTensorInfo(*instance_normalization.bias_operand_id),
++        [](auto) { return std::nullopt; });
++    op_inputs.push_back(bias_tensor_info.index);
++  }
++  ASSIGN_OR_RETURN(
++      const TensorInfo output_tensor_info,
++      SerializeOutputTensorInfo(instance_normalization.output_operand_id),
++      [](auto) { return std::nullopt; });
++  const std::array<TensorIndex, 1> op_outputs = {output_tensor_info.index};
++
++  // Attributes flexbuffer: `{"num_groups": int, "epsilon": float}`. Instance
++  // norm normalizes each channel independently, i.e. one channel per group, so
++  // num_groups == channels. GroupNormParser only reads these when
++  // `custom_initial_data` is present -- otherwise it silently defaults to
++  // groups=32/epsilon=1e-6 -- so both must always be written.
++  flexbuffers::Builder fbb;
++  fbb.Map([&] {
++    fbb.Int("num_groups", base::checked_cast<int32_t>(channels));
++    fbb.Float("epsilon", instance_normalization.epsilon);
++  });
++  fbb.Finish();
++  const auto custom_options = builder_.CreateVector(fbb.GetBuffer());
++
++  return ::tflite::CreateOperator(
++      builder_, GetCustomOperatorCodeIndex("custom_call.GroupNorm"),
++      builder_.CreateVector<TensorIndex>(op_inputs),
++      builder_.CreateVector<TensorIndex>(op_outputs),
++      ::tflite::BuiltinOptions_NONE, /*builtin_options=*/0, custom_options,
++      ::tflite::CustomOptionsFormat_FLEXBUFFERS);
++}
++
+ auto GraphBuilderTflite::SerializeInstanceNormalization(
+     const mojom::InstanceNormalization& instance_normalization)
+     -> base::expected<OperatorOffset, std::string> {
+@@ -7521,6 +7631,17 @@ auto GraphBuilderTflite::SerializeInstanceNormalization(
+       context_properties_.data_type_limits.instance_normalization_input
+           .Supports(
+               GetOperand(instance_normalization.input_operand_id).descriptor));
++
++  // Try the fused `custom_call.GroupNorm` path first. If any precondition
++  // fails, fall through to the primitive emulation below.
++#if BUILDFLAG(WEBNN_USE_WEBGPU_ACCELERATOR)
++  if (auto fused =
++          SerializeInstanceNormalizationAsCustomCall(instance_normalization);
++      fused.has_value()) {
++    return *fused;
++  }
++#endif  // BUILDFLAG(WEBNN_USE_WEBGPU_ACCELERATOR)
++
+   ASSIGN_OR_RETURN(
+       const TensorInfo& input_tensor_info,
+       SerializeInputTensorInfo(instance_normalization.input_operand_id));
+diff --git a/services/webnn/tflite/graph_builder_tflite.h b/services/webnn/tflite/graph_builder_tflite.h
+index 4864e10de0625..d65b6b0cc346a 100644
+--- a/services/webnn/tflite/graph_builder_tflite.h
++++ b/services/webnn/tflite/graph_builder_tflite.h
+@@ -799,6 +799,12 @@ class GraphBuilderTflite final {
+   OperatorOffset SerializeIdentityOperation(TensorIndex input_tensor_index,
+                                             TensorIndex output_tensor_index,
+                                             base::span<const int32_t> shape);
++  // Emits a `custom_call.GroupNorm` custom op (instance norm == group norm with
++  // one channel per group) if supported by `context_device_`. Returns
++  // `std::nullopt` otherwise.
++  std::optional<OperatorOffset> SerializeInstanceNormalizationAsCustomCall(
++      const mojom::InstanceNormalization& instance_normalization);
++
+   base::expected<OperatorOffset, std::string> SerializeInstanceNormalization(
+       const mojom::InstanceNormalization& instance_normalization);
+   base::expected<OperatorOffset, std::string> SerializeLayerNormalization(
+-- 
+2.51.0.windows.2
+
