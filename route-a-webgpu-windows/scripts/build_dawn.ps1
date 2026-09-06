@@ -15,9 +15,14 @@
 #   - $ChromiumVersion should match the Chrome build the DLL will be loaded into.
 
 param(
-    [string]$SrcDir           = "C:\Users\fujun\workspace\webnn\_webgpu_dawn_src",
-    [string]$Dest             = "C:\Users\fujun\workspace\webnn\_dawn_prebuilt_win",
-    [string]$ChromiumVersion  = "153.0.8010.0"
+    [string]$SrcDir           = "C:\Users\junwei\workspace\webnn\_webgpu_dawn_src",
+    [string]$Dest             = "C:\Users\junwei\workspace\webnn\_dawn_prebuilt_win",
+    [string]$ChromiumVersion  = "155.0.8044.0",
+    # Directory containing a python3.exe (depot_tools' bootstrapped CPython works).
+    # A `python.exe` alias is created next to it if missing, because Dawn's CMake
+    # scripts and some generators invoke bare `python`.
+    [string]$PythonDir        = "",
+    [string]$DepotTools       = "C:\Users\junwei\workspace\depot_tools"
 )
 
 $ErrorActionPreference = "Stop"
@@ -27,9 +32,61 @@ $ErrorActionPreference = "Stop"
 $env:Path = [Environment]::GetEnvironmentVariable("Path", "Machine") + ";" +
             [Environment]::GetEnvironmentVariable("Path", "User")
 
+# ---- Python ----
+# Windows ships a `python.exe` App Execution Alias that only opens the Store, and
+# depot_tools bootstraps CPython as `python3.exe` with no `python.exe` next to it.
+# Dawn's CMake needs a real interpreter under both names, so resolve one and put
+# it first on PATH.
+if (-not $PythonDir) {
+    $PythonDir = Get-ChildItem $DepotTools -Filter "bootstrap-*_bin" -Directory -ErrorAction SilentlyContinue |
+        ForEach-Object { Join-Path $_.FullName "python3\bin" } |
+        Where-Object { Test-Path (Join-Path $_ "python3.exe") } |
+        Select-Object -First 1
+}
+if ($PythonDir) {
+    if (-not (Test-Path (Join-Path $PythonDir "python.exe"))) {
+        Copy-Item (Join-Path $PythonDir "python3.exe") (Join-Path $PythonDir "python.exe")
+        Write-Host "Created python.exe alias in $PythonDir"
+    }
+    $env:Path = "$PythonDir;$env:Path"
+}
+Write-Host "python: $((Get-Command python -ErrorAction SilentlyContinue).Source)"
+
 if (-not (Test-Path $SrcDir)) {
     Write-Host "Cloning webgpu-dawn-binaries into $SrcDir..."
+    # git/cmake write progress to stderr. Under $ErrorActionPreference='Stop'
+    # PowerShell promotes native-command stderr to a terminating NativeCommandError
+    # even on exit code 0, so drop to 'Continue' and gate on $LASTEXITCODE instead.
+    $ErrorActionPreference = "Continue"
     git clone https://github.com/jspanchu/webgpu-dawn-binaries.git $SrcDir
+    $rc = $LASTEXITCODE
+    $ErrorActionPreference = "Stop"
+    if ($rc -ne 0) { throw "git clone failed (exit $rc)" }
+}
+
+# webgpu-dawn-binaries' CMakeLists derives the Dawn ref from the BUILD field of
+# chromium_version.txt: `GIT_TAG chromium/<BUILD>`. Dawn only creates a
+# `chromium/<N>` branch once that Chromium milestone is cut, so a bleeding-edge
+# Chromium main checkout is routinely 1-2 builds ahead of the newest Dawn branch
+# and the clone dies with `fatal: invalid reference: chromium/<BUILD>`.
+# Fall back to the highest published branch <= our BUILD.
+$verParts = $ChromiumVersion.Split(".")
+$wantBuild = [int]$verParts[2]
+$ErrorActionPreference = "Continue"
+$branches = git ls-remote --heads https://dawn.googlesource.com/dawn "refs/heads/chromium/*" 2>$null |
+    ForEach-Object { ($_ -split "\s+")[1] -replace "refs/heads/chromium/", "" } |
+    Where-Object { $_ -match "^\d+$" } | ForEach-Object { [int]$_ }
+$ErrorActionPreference = "Stop"
+if ($branches) {
+    $usable = $branches | Where-Object { $_ -le $wantBuild } | Sort-Object | Select-Object -Last 1
+    if (-not $usable) { throw "No dawn chromium/<N> branch at or below $wantBuild" }
+    if ($usable -ne $wantBuild) {
+        Write-Host "Dawn has no chromium/$wantBuild branch; using chromium/$usable (newest <= $wantBuild)."
+        $verParts[2] = "$usable"
+        $ChromiumVersion = $verParts -join "."
+    }
+} else {
+    Write-Host "WARNING: could not list dawn branches; using $ChromiumVersion as-is."
 }
 
 Set-Content -Path (Join-Path $SrcDir "chromium_version.txt") -Value $ChromiumVersion -NoNewline
@@ -40,6 +97,9 @@ New-Item -ItemType Directory -Force -Path $BuildDir | Out-Null
 
 Push-Location $BuildDir
 try {
+    # See the note above: cmake streams status to stderr, so keep native-command
+    # stderr non-terminating and rely on $LASTEXITCODE for failure detection.
+    $ErrorActionPreference = "Continue"
     Write-Host "Configuring CMake (monolithic shared DLL)..."
     # DAWN_BUILD_MONOLITHIC_LIBRARY=SHARED produces a single webgpu_dawn.dll
     # exporting all wgpu* C symbols (300+).
@@ -59,6 +119,7 @@ try {
     Write-Host "Building Dawn Release (this takes 30-60 min)..."
     cmake --build . --config Release
     if ($LASTEXITCODE -ne 0) { throw "cmake --build failed" }
+    $ErrorActionPreference = "Stop"
 } finally {
     Pop-Location
 }

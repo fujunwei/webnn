@@ -15,8 +15,8 @@
 
 param(
     [Parameter(Mandatory=$true)] [string]$ChromeOutDir,
-    [string]$ChromiumSrc = "C:\Users\fujun\workspace\chromium\src",
-    [string]$WebnnDir    = "C:\Users\fujun\workspace\webnn",
+    [string]$ChromiumSrc = "C:\Users\junwei\workspace\chromium\src",
+    [string]$WebnnDir    = "C:\Users\junwei\workspace\webnn",
     [switch]$SkipStage,        # skip DLL copy step (use whatever is already in out dir)
     [switch]$SkipBuild         # only stage, don't run autoninja
 )

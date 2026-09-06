@@ -3,8 +3,8 @@
 param(
     [Parameter(Mandatory=$true)] [string]$ChromeOutDir,
     [ValidateSet("dbg","opt")]   [string]$Mode = "dbg",
-    [string]$ChromiumSrc = "C:\Users\fujun\workspace\chromium\src",
-    [string]$WebnnDir    = "C:\Users\fujun\workspace\webnn"
+    [string]$ChromiumSrc = "C:\Users\junwei\workspace\chromium\src",
+    [string]$WebnnDir    = "C:\Users\junwei\workspace\webnn"
 )
 
 $ErrorActionPreference = "Stop"
