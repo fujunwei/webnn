@@ -83,6 +83,12 @@ out\Release\sam_encoder_runner.exe --model=C:\...\model.tflite --verify --tolera
 ### 3.4 外部输入 + dump 完整输出（离线 diff）
 
 ```powershell
+# 使用AI提示词自动验证是否一致
+"验证C:\Users\junwei\workspace\tflite-dump-model\segment_anything_verify目录下segment_anything_encoder.tflite使用GPU+CPU-fallback (fp16)运行在GPU ML Drift delegate下是否和no_layer_norm_segment_anything_encoder.tflite运行在CPU下结果一致，使用C:\Users\junwei\workspace\chromium\src
+  \out\upstream_bots_debug\sam_encoder_runner"
+```
+
+```powershell
 # 实测：MobileNet + tiger_input.bin，GPU vs CPU 对比（--dump-outputs 是文件名前缀）
 .\out\upstream_bots_debug\sam_encoder_runner.exe --model=D:\tflite-dump-model\mobilenet_verify\mobilenet.tflite --verify `
     --input=D:\tflite-dump-model\tiger_input.bin --dump-outputs=D:\tflite-dump-model\mobilenet_verify --precision=fp32

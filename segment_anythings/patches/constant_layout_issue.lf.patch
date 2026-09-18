@@ -1,0 +1,361 @@
+From 4c52c2b7eaa1e58eb461dc055c32d00b45cd51a3 Mon Sep 17 00:00:00 2001
+From: Wei Wang <wei4.wang@intel.com>
+Date: Mon, 31 Aug 2026 14:31:16 +0800
+Subject: [PATCH] Initial upload.
+
+---
+ ml_drift_delegate/tflite/BUILD                |   1 +
+ ml_drift_delegate/tflite/model_builder.cc     |  30 ++++-
+ .../tflite/model_builder_test.cc              | 105 ++++++++++++++++++
+ ml_drift_delegate/tflite/object_reader.cc     |   6 +-
+ .../tflite/object_reader_test.cc              | 101 +++++++++++++++++
+ 5 files changed, 241 insertions(+), 2 deletions(-)
+
+diff --git a/ml_drift_delegate/tflite/BUILD b/ml_drift_delegate/tflite/BUILD
+index 0d24a43cb1..c706193405 100644
+--- a/ml_drift_delegate/tflite/BUILD
++++ b/ml_drift_delegate/tflite/BUILD
+@@ -241,6 +241,7 @@ cc_test(
+         "@com_google_googletest//:gtest_main",
+         "@ml_drift//ml_drift/common:data_type",
+         "@ml_drift//ml_drift/common:model",
++        "@ml_drift//ml_drift/common:operations",
+         "@ml_drift//ml_drift/common:shape",
+         "@ml_drift//ml_drift/common:tensor",
+         "@ml_drift//ml_drift/common:types",
+diff --git a/ml_drift_delegate/tflite/model_builder.cc b/ml_drift_delegate/tflite/model_builder.cc
+index 6010aa5712..e46bc48fa9 100755
+--- a/ml_drift_delegate/tflite/model_builder.cc
++++ b/ml_drift_delegate/tflite/model_builder.cc
+@@ -2722,14 +2722,17 @@ class ElementwiseOperationParser : public TFLiteOperationParser {
+     int runtime_tensor_index;
+     int constant_tensor_index;
+     const TfLiteTensor* constant_tensor;
++    const TfLiteTensor* runtime_tensor;
+     if (constant_tensor0) {
+       runtime_tensor_index = 1;
+       constant_tensor_index = 0;
+       constant_tensor = input0;
++      runtime_tensor = input1;
+     } else {
+       runtime_tensor_index = 0;
+       constant_tensor_index = 1;
+       constant_tensor = input1;
++      runtime_tensor = input0;
+     }
+ 
+     reader->AddInput(node, runtime_tensor_index);
+@@ -2760,8 +2763,10 @@ class ElementwiseOperationParser : public TFLiteOperationParser {
+     }
+     if (!convertible_to_f32) {
+       if (reader->IsConstantTensor(constant_tensor_index)) {
++        const SizedLayout layout = BroadcastConstLayout(
++            constant_dims->size, runtime_tensor->dims->size);
+         const ::ml_drift::Value* input =
+-            reader->AddConstInput(constant_tensor_index, /*layout=*/{});
++            reader->AddConstInput(constant_tensor_index, layout);
+         graph->AddConsumer(node->id, input->id);
+       } else {
+         reader->AddInput(node, constant_tensor_index);
+@@ -2900,6 +2905,29 @@ class ElementwiseOperationParser : public TFLiteOperationParser {
+                             dims->data[3]);
+   }
+ 
++  // Returns the layout with which a constant operand has to be read so that it
++  // broadcasts against a runtime operand of `runtime_rank`.
++  //
++  // TFLite/numpy broadcasting is right-aligned, but ml-drift maps TFLite dim 0
++  // to BHWC's batch, i.e. it is left-aligned. A constant of lower rank than the
++  // runtime operand therefore has to be relabeled onto the trailing axes;
++  // otherwise the GPU elementwise broadcast reads only batch-0 and splats it to
++  // every channel.
++  //
++  // This encodes the same right-alignment rule as
++  // ExtractTensorShapeWithTfLiteBroadcast() above, expressed as a SizedLayout
++  // because that is what ObjectReader::AddConstInput() takes. Keep the two in
++  // sync.
++  static SizedLayout BroadcastConstLayout(int constant_rank, int runtime_rank) {
++    SizedLayout layout;
++    if (constant_rank < runtime_rank) {
++      layout.layout_1d = ::ml_drift::Layout::SCALAR;  // [C] -> 1x1x1xC
++      layout.layout_2d = ::ml_drift::Layout::HW;      // [W,C] -> 1x1xWxC
++      layout.layout_3d = ::ml_drift::Layout::HWC;     // [H,W,C] -> 1xHxWxC
++    }
++    return layout;
++  }
++
+   absl::Status PreCheckInputsWithConstTensor(const TfLiteContext* context,
+                                              const TfLiteNode* tflite_node,
+                                              const std::string& opname) {
+diff --git a/ml_drift_delegate/tflite/model_builder_test.cc b/ml_drift_delegate/tflite/model_builder_test.cc
+index 16049c8b7f..a26286a7a7 100644
+--- a/ml_drift_delegate/tflite/model_builder_test.cc
++++ b/ml_drift_delegate/tflite/model_builder_test.cc
+@@ -22,6 +22,7 @@
+ #include <cstring>
+ #include <memory>
+ #include <utility>
++#include <variant>
+ #include <vector>
+ 
+ #include "testing/base/public/gmock.h"
+@@ -2515,6 +2516,110 @@ TEST(ArithmeticBinaryElementwiseOperationParserTest, TestIsSupported) {
+           .ok());
+ }
+ 
++// A constant operand of an elementwise op has to be re-aligned onto BHWC's
++// trailing axes when its rank is lower than the runtime operand's, because
++// TFLite broadcasting is right-aligned while ml-drift maps TFLite dim 0 to
++// batch. Without it the GPU elementwise broadcast reads batch-0 only and splats
++// it across the channels, silently corrupting the result.
++class ElementwiseConstOperandTest : public testing::Test {
++ public:
++  // StubTfLiteContext wires tensors {1, 2} as the inputs of the node under
++  // test.
++  enum { kRuntimeTensorIdx = 1, kConstTensorIdx = 2 };
++
++ protected:
++  // Builds a MINIMUM node with an INT32 runtime operand of shape
++  // `runtime_dims` and an INT32 constant operand of shape `const_dims`. INT32
++  // keeps the constant out of the float paths, which convert it to a Linear or
++  // BHWC attribute instead of a CONSTANT node.
++  void SetUpTensors(const std::vector<int>& runtime_dims,
++                    const std::vector<int>& const_dims) {
++    context_ = std::make_unique<StubTfLiteContext>(kTfLiteBuiltinMinimum,
++                                                   /*op_version=*/1,
++                                                   /*num_inputs=*/2,
++                                                   /*shape=*/runtime_dims);
++    context_->ChangeTensorShape(kConstTensorIdx, const_dims);
++    context_->SetTensorType(kRuntimeTensorIdx, kTfLiteInt32, kTfLiteArenaRw);
++    context_->SetTensorType(kConstTensorIdx, kTfLiteInt32, kTfLiteMmapRo);
++    parser_ = NewOperationParser(context_->node(), context_->registration());
++    ASSERT_NE(parser_, nullptr);
++  }
++
++  // Parses the node and returns the shape its constant operand ended up with.
++  ::ml_drift::BHWC ParseAndGetConstShape() {
++    ObjectReader reader(&graph_, context_.get(), context_->node(),
++                        &tensor_to_value_, /*quant_conversion_map=*/nullptr,
++                        /*tensor_to_buffer_id_map=*/nullptr,
++                        /*tensor_to_external_buffer_id_map=*/nullptr,
++                        /*shared_tensor_map=*/nullptr);
++    // Parse() returns void; a rejected node simply leaves no CONSTANT node
++    // behind, which the ADD_FAILURE() at the bottom reports.
++    parser_->Parse(context_->node(), context_->registration(), &graph_,
++                   &reader);
++    for (::ml_drift::Node* node : graph_.nodes()) {
++      if (node->operation.type !=
++          ToString(::ml_drift::OperationType::CONSTANT)) {
++        continue;
++      }
++      const std::vector<::ml_drift::Value*> outputs =
++          graph_.FindOutputs(node->id);
++      if (outputs.size() != 1) {
++        ADD_FAILURE() << "The CONSTANT node produces " << outputs.size()
++                      << " values, expected 1.";
++        return ::ml_drift::BHWC();
++      }
++      // The constant data has to carry the very same shape as the Value:
++      // ml-drift's ReserveGraphTensors() rejects the model otherwise.
++      const auto* attr = std::any_cast<::ml_drift::ConstTensorAttributes>(
++          &node->operation.attributes);
++      EXPECT_NE(attr, nullptr);
++      if (attr != nullptr) {
++        EXPECT_EQ(
++            std::visit([](const auto& t) { return t.shape; }, attr->tensor),
++            outputs[0]->tensor.shape);
++      }
++      return outputs[0]->tensor.shape;
++    }
++    ADD_FAILURE() << "The parsed graph holds no CONSTANT node.";
++    return ::ml_drift::BHWC();
++  }
++
++  std::unique_ptr<StubTfLiteContext> context_;
++  std::unique_ptr<TFLiteOperationParser> parser_;
++  ::ml_drift::GraphFloat32 graph_;
++  absl::flat_hash_map<int, ::ml_drift::Value*> tensor_to_value_;
++};
++
++TEST_F(ElementwiseConstOperandTest, Rank1ConstantAgainstRank4RuntimeUsesC) {
++  SetUpTensors(/*runtime_dims=*/{1, 1, 1, 3}, /*const_dims=*/{3});
++  EXPECT_EQ(ParseAndGetConstShape(), ::ml_drift::BHWC(1, 1, 1, 3));
++}
++
++TEST_F(ElementwiseConstOperandTest, Rank1ConstantAgainstRank2RuntimeUsesC) {
++  SetUpTensors(/*runtime_dims=*/{2, 3}, /*const_dims=*/{3});
++  EXPECT_EQ(ParseAndGetConstShape(), ::ml_drift::BHWC(1, 1, 1, 3));
++}
++
++TEST_F(ElementwiseConstOperandTest, Rank2ConstantAgainstRank4RuntimeUsesWC) {
++  SetUpTensors(/*runtime_dims=*/{1, 1, 2, 3}, /*const_dims=*/{2, 3});
++  EXPECT_EQ(ParseAndGetConstShape(), ::ml_drift::BHWC(1, 1, 2, 3));
++}
++
++TEST_F(ElementwiseConstOperandTest, Rank3ConstantAgainstRank4RuntimeUsesHWC) {
++  SetUpTensors(/*runtime_dims=*/{1, 2, 3, 4}, /*const_dims=*/{2, 3, 4});
++  EXPECT_EQ(ParseAndGetConstShape(), ::ml_drift::BHWC(1, 2, 3, 4));
++}
++
++TEST_F(ElementwiseConstOperandTest, Rank1ConstantAgainstRank1RuntimeKeepsB) {
++  SetUpTensors(/*runtime_dims=*/{3}, /*const_dims=*/{3});
++  EXPECT_EQ(ParseAndGetConstShape(), ::ml_drift::BHWC(3, 1, 1, 1));
++}
++
++TEST_F(ElementwiseConstOperandTest, Rank2ConstantAgainstRank2RuntimeKeepsB) {
++  SetUpTensors(/*runtime_dims=*/{2, 3}, /*const_dims=*/{2, 3});
++  EXPECT_EQ(ParseAndGetConstShape(), ::ml_drift::BHWC(2, 1, 1, 3));
++}
++
+ class FullyConnectedOperationParserTest : public testing::Test {
+   void SetUp() override {
+     context_ = std::make_unique<StubTfLiteContext>(
+diff --git a/ml_drift_delegate/tflite/object_reader.cc b/ml_drift_delegate/tflite/object_reader.cc
+index f796ab930b..208f572ba9 100644
+--- a/ml_drift_delegate/tflite/object_reader.cc
++++ b/ml_drift_delegate/tflite/object_reader.cc
+@@ -59,8 +59,12 @@ void SetValueAndAttrFromTfLiteTensor(const TfLiteTensor* tfl_tensor,
+                                      ::ml_drift::ConstTensorAttributes& attr) {
+   TensorType t;
+   TfLiteTensorToTensorCopyData(tfl_tensor, &t, ReadTensorFlags::kNoExtraBytes);
++  // The requested layout has to be applied to the constant data as well as to
++  // the Value: ReserveGraphTensors() cross-checks the two shapes and rejects
++  // the model if they disagree.
++  t.shape = GetShape(t.shape, layout, tfl_tensor->dims->size);
+   value->tensor.type = t.kType;
+-  value->tensor.shape = GetShape(t.shape, layout, tfl_tensor->dims->size);
++  value->tensor.shape = t.shape;
+   attr.tensor = std::move(t);
+ }
+ 
+diff --git a/ml_drift_delegate/tflite/object_reader_test.cc b/ml_drift_delegate/tflite/object_reader_test.cc
+index 0aefdc6aa6..f9ff89b671 100644
+--- a/ml_drift_delegate/tflite/object_reader_test.cc
++++ b/ml_drift_delegate/tflite/object_reader_test.cc
+@@ -14,11 +14,14 @@
+ 
+ #include "ml_drift_delegate/tflite/object_reader.h"
+ 
++#include <any>
+ #include <cstdint>
+ #include <cstdlib>
++#include <cstring>
+ #include <memory>
+ #include <optional>
+ #include <string>
++#include <variant>
+ #include <vector>
+ 
+ #include "testing/base/public/gmock.h"
+@@ -28,6 +31,7 @@
+ #include "absl/types/span.h"  // from @com_google_absl
+ #include "ml_drift/common/data_type.h"  // from @ml_drift
+ #include "ml_drift/common/model.h"  // from @ml_drift
++#include "ml_drift/common/operations.h"  // from @ml_drift
+ #include "ml_drift/common/shape.h"  // from @ml_drift
+ #include "ml_drift/common/tensor.h"  // from @ml_drift
+ #include "ml_drift/common/types.h"  // from @ml_drift
+@@ -214,6 +218,103 @@ TEST_F(ObjectBuilderSharingTest, SetSharedTensorWorks) {
+   EXPECT_EQ(shared_tensor_map_.at(kFakeGraphNodeId), kExpected);
+ }
+ 
++// Tests for AddConstInput(). The layout requested by the caller must reach both
++// the Value and the constant data held by the CONSTANT node's attributes:
++// ml-drift's ReserveGraphTensors() cross-checks the two shapes and rejects the
++// model if they disagree.
++class AddConstInputTest : public testing::Test {
++ public:
++  // StubTfLiteContext wires tensors {1, 2} as the inputs of the node under
++  // test.
++  enum { kConstTensorIdx = 2, kConstInputPos = 1 };
++
++ protected:
++  // Turns the constant input into an INT32 tensor of shape `dims` holding
++  // `data`.
++  void SetUpConstInt32Tensor(const std::vector<int>& dims,
++                             const std::vector<int32_t>& data) {
++    context_->ChangeTensorShape(kConstTensorIdx, dims);
++    TfLiteTensor* tensor = context_->tensor(kConstTensorIdx);
++    tensor->type = kTfLiteInt32;
++    tensor->allocation_type = kTfLiteMmapRo;
++    ASSERT_EQ(tensor->bytes, data.size() * sizeof(int32_t));
++    std::memcpy(tensor->data.raw, data.data(), tensor->bytes);
++  }
++
++  // Returns the constant tensor stored in the attributes of the CONSTANT node
++  // producing `value`.
++  const ::ml_drift::TensorInt32* GetConstAttrTensor(
++      const ::ml_drift::Value* value) {
++    ::ml_drift::Node* producer = graph_.FindProducer(value->id);
++    if (producer == nullptr) return nullptr;
++    const auto* attr = std::any_cast<::ml_drift::ConstTensorAttributes>(
++        &producer->operation.attributes);
++    if (attr == nullptr) return nullptr;
++    return std::get_if<::ml_drift::TensorInt32>(&attr->tensor);
++  }
++
++  std::unique_ptr<StubTfLiteContext> context_ =
++      std::make_unique<StubTfLiteContext>(kTfLiteBuiltinMinimum,
++                                          /*op_version=*/1,
++                                          /*num_inputs=*/2,
++                                          /*shape=*/std::vector<int>({1, 3}));
++  ::ml_drift::GraphFloat32 graph_;
++  absl::flat_hash_map<int, ::ml_drift::Value*> tensor_to_value_;
++  ObjectReader reader_ = ObjectReader(
++      &graph_, context_.get(), context_->node(), &tensor_to_value_,
++      /*quant_conversion_map=*/nullptr, /*tensor_to_buffer_id_map=*/nullptr,
++      /*tensor_to_external_buffer_id_map=*/nullptr,
++      /*shared_tensor_map=*/nullptr);
++};
++
++TEST_F(AddConstInputTest, DefaultLayoutPutsFirstDimensionInBatch) {
++  SetUpConstInt32Tensor(/*dims=*/{3}, /*data=*/{0, 7, 126});
++
++  const ::ml_drift::Value* value =
++      reader_.AddConstInput(kConstInputPos, /*layout=*/{});
++
++  ASSERT_NE(value, nullptr);
++  EXPECT_EQ(value->tensor.shape, ::ml_drift::BHWC(3, 1, 1, 1));
++  const ::ml_drift::TensorInt32* t = GetConstAttrTensor(value);
++  ASSERT_NE(t, nullptr);
++  EXPECT_EQ(t->shape, value->tensor.shape);
++  EXPECT_THAT(t->data, testing::ElementsAre(0, 7, 126));
++}
++
++TEST_F(AddConstInputTest, Layout1dScalarMovesLengthToChannelsInValueAndAttr) {
++  SetUpConstInt32Tensor(/*dims=*/{3}, /*data=*/{0, 7, 126});
++
++  SizedLayout layout;
++  layout.layout_1d = ::ml_drift::Layout::SCALAR;
++  const ::ml_drift::Value* value =
++      reader_.AddConstInput(kConstInputPos, layout);
++
++  ASSERT_NE(value, nullptr);
++  EXPECT_EQ(value->tensor.shape, ::ml_drift::BHWC(1, 1, 1, 3));
++  const ::ml_drift::TensorInt32* t = GetConstAttrTensor(value);
++  ASSERT_NE(t, nullptr);
++  // The attributes must carry the very same shape, and relabeling axes of
++  // extent 1 must not reorder the data.
++  EXPECT_EQ(t->shape, value->tensor.shape);
++  EXPECT_THAT(t->data, testing::ElementsAre(0, 7, 126));
++}
++
++TEST_F(AddConstInputTest, Layout2dHwMovesDimensionsToWidthAndChannels) {
++  SetUpConstInt32Tensor(/*dims=*/{2, 3}, /*data=*/{0, 1, 2, 3, 4, 5});
++
++  SizedLayout layout;
++  layout.layout_2d = ::ml_drift::Layout::HW;
++  const ::ml_drift::Value* value =
++      reader_.AddConstInput(kConstInputPos, layout);
++
++  ASSERT_NE(value, nullptr);
++  EXPECT_EQ(value->tensor.shape, ::ml_drift::BHWC(1, 1, 2, 3));
++  const ::ml_drift::TensorInt32* t = GetConstAttrTensor(value);
++  ASSERT_NE(t, nullptr);
++  EXPECT_EQ(t->shape, value->tensor.shape);
++  EXPECT_THAT(t->data, testing::ElementsAre(0, 1, 2, 3, 4, 5));
++}
++
+ TEST(TfLiteTensorToTensorTest, Float2D) {
+   float data[5] = {1.0, 2.0, 3.0, 4.0, 5.0};
+   SimpleConstTensor tfl_tensor(TfLiteType::kTfLiteFloat32, {1, 5},

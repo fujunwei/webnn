@@ -1,8 +1,8 @@
 diff --git a/WORKSPACE b/WORKSPACE
-index 153f46f32..2ccf55600 100644
+index 48b6bf7..baab2b3 100644
 --- a/WORKSPACE
 +++ b/WORKSPACE
-@@ -365,12 +365,13 @@ load("//third_party/google_tensor:workspace.bzl", "google_tensor")
+@@ -399,12 +399,13 @@ load("//third_party/google_tensor:workspace.bzl", "google_tensor")
  google_tensor()
  
  # ML Drift ----------------------------------------------------------------------------------
@@ -10,7 +10,7 @@ index 153f46f32..2ccf55600 100644
 +# webnn route-A: use local_repository pointing to chromium's ml-drift checkout.
 +local_repository(
      name = "ml_drift",
-+    path = "C:/Users/junweifu/workspace/chromium/src/third_party/ml-drift",
++    path = "C:/Users/awx_localadmin/workspace/chromium/src/third_party/ml-drift",
      repo_mapping = {
          "@fp16": "@FP16",
      },

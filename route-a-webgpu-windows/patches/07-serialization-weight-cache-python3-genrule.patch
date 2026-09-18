@@ -1,0 +1,29 @@
+diff --git a/ml_drift_delegate/delegate/serialization_weight_cache/BUILD b/ml_drift_delegate/delegate/serialization_weight_cache/BUILD
+index b6b7e3f..8886f5b 100644
+--- a/ml_drift_delegate/delegate/serialization_weight_cache/BUILD
++++ b/ml_drift_delegate/delegate/serialization_weight_cache/BUILD
+@@ -118,8 +118,22 @@ genrule(
+         "@ml_drift//ml_drift/common/kernels:fully_connected.cc",
+     ],
+     outs = ["srcs/build_identifier.cc"],
+-    cmd = "$(location :generate_build_identifier_py) --output $@ $(SRCS)",
+-    tools = [":generate_build_identifier_py"],
++    # webnn route-A (Windows): invoke the interpreter directly on the .py
++    # source via the current_py_toolchain's $(PYTHON3) make-variable instead
++    # of running through the :generate_build_identifier_py py_binary. The
++    # py_binary's runfiles tree mirrors this package's path twice (once under
++    # bazel-out/.../bin/, once again under
++    # <target>.runfiles/litert/ml_drift_delegate/delegate/serialization_weight_cache/),
++    # which pushes the stage2 bootstrap script past Windows' 260-char MAX_PATH
++    # even with the shortest possible Bazel output_base -- Python then fails
++    # with "file not found" despite the file existing (verified reachable via
++    # the \\?\ long-path prefix). Running the source file directly avoids that
++    # nesting entirely; the script itself is stdlib-only (argparse/hashlib/
++    # sys/textwrap) with no runfiles dependency, so this is a pure invocation
++    # change with identical behavior on POSIX.
++    cmd = "$(PYTHON3) $(location generate_build_identifier.py) --output $@ $(SRCS)",
++    tools = ["generate_build_identifier.py"],
++    toolchains = ["@rules_python//python:current_py_toolchain"],
+ )
+ 
+ py_binary(

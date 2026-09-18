@@ -1,10 +1,9 @@
-# Deploy the built accelerator DLL + Dawn DLL into a Chromium output dir.
+# Deploy the built accelerator DLL into a Chromium output dir.
 
 param(
     [Parameter(Mandatory=$true)] [string]$ChromeOutDir,
     [ValidateSet("dbg","opt")]   [string]$Mode = "dbg",
-    [string]$ChromiumSrc = "C:\Users\fujun\workspace\chromium\src",
-    [string]$WebnnDir    = "C:\Users\fujun\workspace\webnn"
+    [string]$ChromiumSrc = "C:\Users\awx_localadmin\workspace\chromium\src"
 )
 
 $ErrorActionPreference = "Stop"
@@ -16,11 +15,8 @@ $cfg    = if ($Mode -eq "dbg") { "x64_windows-dbg" } else { "x64_windows-opt" }
 
 $dllSrc = Join-Path $LITERT "bazel-bin\litert\runtime\accelerators\gpu\libLiteRtWebGpuAccelerator.dll"
 $pdbSrc = Join-Path $LITERT "bazel-bin\litert\runtime\accelerators\gpu\libLiteRtWebGpuAccelerator.pdb"
-$dawnSrc = Join-Path $WebnnDir "_dawn_prebuilt_win\lib\webgpu_dawn.dll"
 
-foreach ($f in @($dllSrc, $dawnSrc)) {
-    if (-not (Test-Path $f)) { throw "Source missing: $f" }
-}
+if (-not (Test-Path $dllSrc)) { throw "Source missing: $dllSrc" }
 
 function Copy-Overwrite($src, $tgt) {
     if (Test-Path $tgt) {
@@ -37,6 +33,5 @@ Copy-Overwrite $dllSrc  (Join-Path $ChromeOutDir "libLiteRtWebGpuAccelerator.dll
 if (Test-Path $pdbSrc) {
     Copy-Overwrite $pdbSrc  (Join-Path $ChromeOutDir "libLiteRtWebGpuAccelerator.pdb")
 }
-Copy-Overwrite $dawnSrc (Join-Path $ChromeOutDir "webgpu_dawn.dll")
 
 Write-Host "OK. Now launch: $ChromeOutDir\chrome.exe --no-sandbox --enable-features=WebMachineLearningNeuralNetwork <test-url>"

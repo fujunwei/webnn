@@ -1,8 +1,8 @@
 diff --git a/chrome/installer/mini_installer/chrome.release b/chrome/installer/mini_installer/chrome.release
-index cf4c3fa1816ed..fc9a8d9d6bf4f 100644
+index b0008cc7bb..f570f244ba 100644
 --- a/chrome/installer/mini_installer/chrome.release
 +++ b/chrome/installer/mini_installer/chrome.release
-@@ -31,6 +31,11 @@ libEGL.dll: %(VersionDir)s\
+@@ -32,6 +32,11 @@ libEGL.dll: %(VersionDir)s\
  libGLESv2.dll: %(VersionDir)s\
  libLiteRtWebGpuAccelerator.dll: %(VersionDir)s\
  notification_helper.exe: %(VersionDir)s\

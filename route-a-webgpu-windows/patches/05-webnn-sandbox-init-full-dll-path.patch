@@ -1,11 +1,11 @@
 diff --git a/services/webnn/public/cpp/webnn_sandbox_init.cc b/services/webnn/public/cpp/webnn_sandbox_init.cc
-index b7e4e53c3537d..bbc74c8ad86df 100644
+index 2d44b4757c..43aa9a72be 100644
 --- a/services/webnn/public/cpp/webnn_sandbox_init.cc
 +++ b/services/webnn/public/cpp/webnn_sandbox_init.cc
-@@ -19,8 +19,22 @@ namespace webnn {
- void PreSandboxWebNNInitialization() {
- #if BUILDFLAG(WEBNN_USE_WEBGPU_ACCELERATOR)
- #if BUILDFLAG(IS_WIN)
+@@ -31,8 +31,22 @@ void PreSandboxWebNNInitialization(bool is_gpu_process) {
+     return;
+   }
+ 
 -  base::FilePath library_path(
 -      FILE_PATH_LITERAL("libLiteRtWebGpuAccelerator.dll"));
 +  // Resolve the DLL to a full path anchored at DIR_MODULE (chrome.dll's dir,
@@ -26,4 +26,4 @@ index b7e4e53c3537d..bbc74c8ad86df 100644
 +  }
    base::LoadNativeLibrary(library_path, nullptr);
  #elif BUILDFLAG(IS_LINUX)
-   base::FilePath library_path;
+   // On Linux, the library is preloaded once in the Zygote process during

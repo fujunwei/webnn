@@ -1,8 +1,8 @@
 diff --git a/ml_drift/common/gpu_info.h b/ml_drift/common/gpu_info.h
-index 18b5759..bd8aa8e 100644
+index 24f565b..4e5fefd 100644
 --- a/ml_drift/common/gpu_info.h
 +++ b/ml_drift/common/gpu_info.h
-@@ -633,10 +633,10 @@ struct OpenGlInfo {
+@@ -637,10 +637,10 @@ struct OpenGlInfo {
  
  struct VulkanInfo {
    std::string vendor_name;

@@ -1,0 +1,94 @@
+diff --git a/ml_drift_delegate/delegate/composite/BUILD b/ml_drift_delegate/delegate/composite/BUILD
+index 91281e6..6dd739b 100644
+--- a/ml_drift_delegate/delegate/composite/BUILD
++++ b/ml_drift_delegate/delegate/composite/BUILD
+@@ -466,7 +466,10 @@ cc_library(
+     deps = [
+         ":add_values_to_cache_kernel",
+         ":add_values_to_cache_parser",
+-        ":moe_experts_kernel",
++        # webnn route-A: ":moe_experts_kernel" dropped. It pulls in
++        # :experts_remap_builder -> @ml_drift//ml_drift/common/kernels/google/custom:experts_remap,
++        # a Google-internal package absent from the public ml-drift repo. With
++        # no reverse deps left, Bazel never analyzes those two targets.
+         ":moe_experts_parser",
+         ":qkv_norm_rope_kernel",
+         ":qkv_norm_rope_parser",
+diff --git a/ml_drift_delegate/delegate/composite/ir/BUILD b/ml_drift_delegate/delegate/composite/ir/BUILD
+index c3a810e..062a9bc 100644
+--- a/ml_drift_delegate/delegate/composite/ir/BUILD
++++ b/ml_drift_delegate/delegate/composite/ir/BUILD
+@@ -170,7 +170,8 @@ cc_library(
+     hdrs = ["litert_op_selector.h"],
+     deps = [
+         "//ml_drift_delegate/delegate/composite:add_values_to_cache_kernel",
+-        "//ml_drift_delegate/delegate/composite:moe_experts_kernel",
++        # webnn route-A: ":moe_experts_kernel" dropped -- see the matching note
++        # in //ml_drift_delegate/delegate/composite:litert_op_selector.
+         "//ml_drift_delegate/delegate/composite:qkv_norm_rope_kernel",
+         "//ml_drift_delegate/delegate/composite:runtime_batched_matmul_kernel",
+         "//ml_drift_delegate/delegate/composite:sdpa_transposed_kernel",
+diff --git a/ml_drift_delegate/delegate/composite/ir/litert_op_selector.cc b/ml_drift_delegate/delegate/composite/ir/litert_op_selector.cc
+index 37546b5..6a33b94 100644
+--- a/ml_drift_delegate/delegate/composite/ir/litert_op_selector.cc
++++ b/ml_drift_delegate/delegate/composite/ir/litert_op_selector.cc
+@@ -30,7 +30,10 @@
+ #include "ml_drift/common/selectors/special_selector.h"  // from @ml_drift
+ #include "ml_drift/common/task/gpu_operation.h"  // from @ml_drift
+ #include "ml_drift_delegate/delegate/composite/add_values_to_cache_kernel.h"
+-#include "ml_drift_delegate/delegate/composite/moe_experts_kernel.h"
++// webnn route-A: moe_experts_kernel.h is intentionally not included -- it
++// transitively needs the Google-internal
++// @ml_drift//ml_drift/common/kernels/google/custom:experts_remap package, which
++// copybara does not export to the public ml-drift repo.
+ #include "ml_drift_delegate/delegate/composite/qkv_norm_rope_kernel.h"
+ #include "ml_drift_delegate/delegate/composite/runtime_batched_matmul_kernel.h"
+ #include "ml_drift_delegate/delegate/composite/sdpa_transposed_kernel.h"
+@@ -63,9 +66,10 @@ absl::Status LiteRtOpSelector::GPUOperationFromNode(
+     model_builder->AddGpuOperation(src_ids, dst_ids, std::move(op),
+                                    "add_values_to_cache");
+     return absl::OkStatus();
+-  } else if (op.name == "moe_experts") {
+-    return CreateMoeExpertsFromIrOp(create_info_, inputs, outputs, op,
+-                                    model_builder);
++    // webnn route-A: no "moe_experts" branch -- the fused MoE kernel is
++    // Google-internal (see the include block). Falling through to
++    // ::ml_drift::GPUOperationFromNode below yields a non-OK status, marking
++    // the node unsupported so TFLite keeps it on CPU.
+   } else if (op.name == "runtime_batched_matmul") {
+     return CreateRuntimeBatchedMatMulFromIrOp(inputs, outputs, op,
+                                               model_builder);
+diff --git a/ml_drift_delegate/delegate/composite/litert_op_selector.cc b/ml_drift_delegate/delegate/composite/litert_op_selector.cc
+index 8863fad..2fd55aa 100644
+--- a/ml_drift_delegate/delegate/composite/litert_op_selector.cc
++++ b/ml_drift_delegate/delegate/composite/litert_op_selector.cc
+@@ -34,7 +34,12 @@
+ #include "ml_drift/common/task/tensor_desc.h"  // from @ml_drift
+ #include "ml_drift_delegate/delegate/composite/add_values_to_cache_kernel.h"
+ #include "ml_drift_delegate/delegate/composite/add_values_to_cache_parser.h"
+-#include "ml_drift_delegate/delegate/composite/moe_experts_kernel.h"
++// webnn route-A: moe_experts_kernel.h is intentionally not included. Its
++// implementation transitively needs
++// @ml_drift//ml_drift/common/kernels/google/custom:experts_remap, a
++// Google-internal package that copybara does not export to the public ml-drift
++// repo, so the target cannot be built OSS. `moe_experts` composites fall back
++// to CPU instead -- see the dispatch site below.
+ #include "ml_drift_delegate/delegate/composite/moe_experts_parser.h"
+ #include "ml_drift_delegate/delegate/composite/qkv_norm_rope_kernel.h"
+ #include "ml_drift_delegate/delegate/composite/qkv_norm_rope_parser.h"
+@@ -181,10 +186,11 @@ absl::Status LiteRtOpSelector::GPUOperationFromNode(
+     return CreateSdpaTransposedFromNode(sdpa_inputs, outputs, node,
+                                         model_builder);
+   }
+-  if (node.operation.type == kMoeExpertsType) {
+-    return CreateMoeExpertsFromNode(create_info_, inputs, outputs, node,
+-                                    model_builder);
+-  }
++  // webnn route-A: no kMoeExpertsType branch -- the fused MoE kernel is
++  // Google-internal (see the include block). Falling through to
++  // ::ml_drift::GPUOperationFromNode below yields a non-OK status for the
++  // unknown "moe_experts" type, which marks the node unsupported so TFLite
++  // keeps it on CPU.
+   if (node.operation.type == kSwigluType) {
+     return CreateSwigluFromNode(inputs, outputs, node, model_builder);
+   }
