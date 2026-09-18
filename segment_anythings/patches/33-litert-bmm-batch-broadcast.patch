@@ -1,0 +1,140 @@
+litert: broadcast BATCH_MATMUL batch axes in the ML Drift parser
+
+BatchedMatMulOperationParser assumed every rank-4 BMM has matching
+batch dims ([model_batch, matmul_batch, M, K] on both sides). The SAM
+encoder attention broadcasts instead:
+
+  - B0 broadcast (QK^T): left [14,14,300,64] @ right [1,14,64,14]. The
+    left merges to [1,196,300,64] (H = model batch outer, slot m*B1+k =
+    left[m][k]) but the right stayed [1,14,64,14], so the conv weights
+    indexed only 14 of the 196 batch slots and every block's attention
+    ran against the wrong K. Cosine vs CPU 0.924 -> fixed with a TILE of
+    the right along H (block repeat: slot m*B1+k reads right[k]).
+  - B1 broadcast (attn@V weights, constant): left [14,14,300,64] @ right
+    [14,1,64,14]. A plain TILE cannot express slot m*B1+k = right[m]
+    (TILE repeats blocks, not interleaves), so the constant data is
+    interleaved on the host and baked into the const node as
+    [1,B0*B1,K,N].
+
+Any other batch broadcast combination is refused in IsSupported so the
+node falls back to CPU instead of computing wrong results.
+
+diff --git a/ml_drift_delegate/tflite/model_builder.cc b/ml_drift_delegate/tflite/model_builder.cc
+index 0349b69..69824c8 100755
+--- a/ml_drift_delegate/tflite/model_builder.cc
++++ b/ml_drift_delegate/tflite/model_builder.cc
+@@ -698,6 +698,36 @@ class BatchedMatMulOperationParser : public TFLiteOperationParser {
+       return absl::UnavailableError(
+           "Not supported batched mat mul case: too many inputs");
+     }
++    // The batch axes of the two inputs must match, or the mismatch must be
++    // the broadcast case handled in Parse (left has a model batch, right
++    // does not, both rank 4). Anything else (e.g. broadcasting the
++    // matmul-batch axis, or a rank-3 mismatch) is not implemented; refuse
++    // the node so it falls back to CPU instead of computing wrong results.
++    // This applies to both the runtime-inputs and constant-weight paths.
++    const TfLiteTensor* in0 = nullptr;
++    const TfLiteTensor* in1 = nullptr;
++    ABSL_RETURN_IF_ERROR(PreGetInputTensor(context, tflite_node, 0, &in0));
++    ABSL_RETURN_IF_ERROR(PreGetInputTensor(context, tflite_node, 1, &in1));
++    const int r0 = in0->dims->size;
++    const int r1 = in1->dims->size;
++    if (r1 >= 3) {
++      const int lb =
++          r0 >= 4 ? in0->dims->data[0] : (r0 == 3 ? in0->dims->data[0] : 1);
++      const int lh = r0 >= 4 ? in0->dims->data[1] : 1;
++      const int rb =
++          r1 >= 4 ? in1->dims->data[0] : (r1 == 3 ? in1->dims->data[0] : 1);
++      const int rh = r1 >= 4 ? in1->dims->data[1] : 1;
++      const int left_batch = (lb != 1 ? lb : 1) * lh;
++      const int right_batch = (rb != 1 ? rb : 1) * rh;
++      if (left_batch != right_batch &&
++          !(r0 == 4 && r1 == 4 && rb == 1 && lb != 1 && rh == lh) &&
++          !(r0 == 4 && r1 == 4 && rb == lb && rh == 1 && lh > 1 &&
++            tflite::IsConstantTensor(in1))) {
++        return absl::UnavailableError(
++            "Not supported batched mat mul case: batch broadcast not "
++            "implemented");
++      }
++    }
+     ABSL_RETURN_IF_ERROR(PreCheckOutputs(context, tflite_node));
+     return absl::OkStatus();
+   }
+@@ -736,13 +766,45 @@ class BatchedMatMulOperationParser : public TFLiteOperationParser {
+     const TfLiteTensor* dst0_tensor = reader->GetOutputTensor(0);
+     ::ml_drift::Value* input0 = reader->ReadValue(0);
+     ::ml_drift::Value* input1 = nullptr;
++    bool right_pre_broadcast = false;
+     if (reader->GetNumberOfRuntimeInputs() == 2) {
+       input1 = reader->ReadValue(1);
+     } else {
+       ABSL_CHECK_EQ(reader->GetNumberOfRuntimeInputs(), 1);
+       ::ml_drift::TensorFloat32 tensor;
+       reader->ReadTensor(1, &tensor, ReadTensorFlags::kNoExtraBytes);
+-      input1 = NewConstNode(std::move(tensor), graph);
++      const TfLiteTensor* src1_tensor = reader->GetInputTensor(1);
++      // Matmul-batch broadcast with a constant right operand: bake the
++      // interleaved weights ([B0,1,K,N] -> [1,B0*B1,K,N], slot m*B1+k holds
++      // right[m]) directly into the constant node instead of emitting graph
++      // ops (a plain TILE repeats blocks, it cannot express this interleave).
++      if (src0_tensor->dims->size == 4 && src1_tensor->dims->size == 4 &&
++          tensor.shape.b != 1 && tensor.shape.h == 1 &&
++          src0_tensor->dims->data[1] > 1 &&
++          src0_tensor->dims->data[0] == tensor.shape.b) {
++        const int b0 = tensor.shape.b;
++        const int b1 = src0_tensor->dims->data[1];
++        const int k_dim = tensor.shape.w;
++        const int n_dim = tensor.shape.c;
++        ::ml_drift::TensorFloat32 tiled;
++        tiled.id = tensor.id;
++        tiled.shape = ::ml_drift::BHWC(1, b0 * b1, k_dim, n_dim);
++        tiled.data.resize(b0 * b1 * k_dim * n_dim);
++        for (int m = 0; m < b0; ++m) {
++          for (int k = 0; k < b1; ++k) {
++            for (int i = 0; i < k_dim; ++i) {
++              for (int j = 0; j < n_dim; ++j) {
++                tiled.data[((m * b1 + k) * k_dim + i) * n_dim + j] =
++                    tensor.data[(m * k_dim + i) * n_dim + j];
++              }
++            }
++          }
++        }
++        input1 = NewConstNode(std::move(tiled), graph);
++        right_pre_broadcast = true;
++      } else {
++        input1 = NewConstNode(std::move(tensor), graph);
++      }
+     }
+     ::ml_drift::Value* output =
+         reader->ReadValueByTensorIdx(tflite_node->outputs->data[0]);
+@@ -778,7 +840,7 @@ class BatchedMatMulOperationParser : public TFLiteOperationParser {
+       left_value->tensor.shape = reshape_attr.new_shape;
+       graph->SetProducer(reshape_left->id, left_value->id);
+     }
+-    if (input1->tensor.shape.b != 1) {
++    if (!right_pre_broadcast && input1->tensor.shape.b != 1) {
+       ::ml_drift::Node* reshape_right = graph->NewNode();
+       reshape_right->operation.type =
+           ToString(::ml_drift::OperationType::RESHAPE);
+@@ -799,6 +861,21 @@ class BatchedMatMulOperationParser : public TFLiteOperationParser {
+       right_value->tensor.type = input1->tensor.type;
+       right_value->tensor.shape = reshape_attr.new_shape;
+       graph->SetProducer(reshape_right->id, right_value->id);
++    } else if (!right_pre_broadcast && input1->tensor.shape.b == 1 &&
++               input0->tensor.shape.b != 1) {
++      // Broadcast the right operand's model batch to match the left. The
++      // reshape above merges the left's B0xB1 into a single H axis with the
++      // model batch outer (slot m*B1+k holds left[m][k]). Tiling the right
++      // along H repeats it block-wise, so slot m*B1+k reads right[k].
++      ::ml_drift::Node* tile_right = graph->NewNode();
++      tile_right->operation.type = ToString(::ml_drift::OperationType::TILE);
++      graph->AddConsumer(tile_right->id, input1->id);
++      right_value = graph->NewValue();
++      right_value->tensor.type = input1->tensor.type;
++      right_value->tensor.shape =
++          ::ml_drift::BHWC(1, input0->tensor.shape.b * input1->tensor.shape.h,
++                           input1->tensor.shape.w, input1->tensor.shape.c);
++      graph->SetProducer(tile_right->id, right_value->id);
+     }
+     if (output->tensor.shape.b != 1) {
+       result_value = graph->NewValue();

@@ -19,7 +19,6 @@ Verified on the Intel UHD 630 (no shader-f16): new fused model fp16 now
 outputs cosine=0.999977 vs the same model at fp32, and no WGSL validation
 errors remain. The fp32 path was already unaffected (src data type = f32).
 
-
 diff --git a/ml_drift/common/kernels/winograd.cc b/ml_drift/common/kernels/winograd.cc
 index aed597d..faf25bf 100644
 --- a/ml_drift/common/kernels/winograd.cc

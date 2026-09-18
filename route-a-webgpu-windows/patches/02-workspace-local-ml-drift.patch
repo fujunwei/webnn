@@ -10,7 +10,7 @@ index 48b6bf7..baab2b3 100644
 +# webnn route-A: use local_repository pointing to chromium's ml-drift checkout.
 +local_repository(
      name = "ml_drift",
-+    path = "C:/Users/junwei/workspace/chromium/src/third_party/ml-drift",
++    path = "C:/Users/awx_localadmin/workspace/chromium/src/third_party/ml-drift",
      repo_mapping = {
          "@fp16": "@FP16",
      },

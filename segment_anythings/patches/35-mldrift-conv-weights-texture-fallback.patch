@@ -1,0 +1,53 @@
+ml-drift: fall back to global memory when conv weights exceed texture
+
+GetKernelParamsAdreno checks the kTexturesX4 weights resource size
+against the adapter's image2D limits and falls back to kGlobalMemory,
+but the non-Adreno paths (including WARP and the WebGPU generic path)
+selected kTexturesX4 unconditionally. A different_weights_for_height
+conv with H = 4096 (the SAM window attention's matmul-as-conv) then
+allocates a 16 x 65536 weights texture, which Dawn rejects on adapters
+with 16384^2 limits; the invalid pipeline silently kills the dispatch and
+the output reads back all zeros.
+
+Move the same check into the generic GetKernelParams tail so every path
+degrades to global memory instead of emitting an invalid texture.
+
+diff --git a/ml_drift/common/kernels/conv_generic.cc b/ml_drift/common/kernels/conv_generic.cc
+index 72a42aa..3cf3b83 100644
+--- a/ml_drift/common/kernels/conv_generic.cc
++++ b/ml_drift/common/kernels/conv_generic.cc
+@@ -3423,6 +3423,34 @@ ConvGeneric::KernelParams GetKernelParams(
+     kernel_params.block_size.y = 1;
+   }
+ 
++  if (kernel_params.weights_upload_type ==
++      ConvGeneric::WeightsUploadType::kTexturesX4) {
++    // Update storage if the weights texture cannot be allocated: mirror the
++    // check GetKernelParamsAdreno performs, for the non-Adreno paths (e.g.
++    // WARP) which would otherwise emit an invalid texture and silently kill
++    // the dispatch (seen with the SAM window attention, whose
++    // different_weights_for_height conv has H = 4096 and produces a
++    // 16 x 65536 weights texture).
++    WeightsDescription weights_desc{
++        /*type=*/conv_params.weights_data_type,
++        /*layout=*/WeightsLayout::k2DX4I4YIsSpatialIAndXIsOOGroupO4,
++        /*output_group_size=*/kernel_params.block_size.w,
++    };
++    OHWDI weights_shape =
++        OHWDI(conv_params.dst_slices * 4, conv_params.kernel_size.y,
++              conv_params.kernel_size.x, conv_params.kernel_size.z,
++              conv_params.src_slices * 4);
++    if (conv_params.different_weights_for_height) {
++      weights_shape.h = dst_shape.h;
++    }
++    const auto tex_size = Get2dResourceSize(weights_desc, weights_shape);
++    if (tex_size.x > gpu_info.GetMaxImage2DWidth() ||
++        tex_size.y > gpu_info.GetMaxImage2DHeight()) {
++      kernel_params.weights_upload_type =
++          ConvGeneric::WeightsUploadType::kGlobalMemory;
++    }
++  }
++
+   kernel_params.weights_desc =
+       GetWeightsDescription(gpu_info, kernel_params, conv_params);
+ 

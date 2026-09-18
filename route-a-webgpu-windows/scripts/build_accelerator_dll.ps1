@@ -10,9 +10,9 @@
 
 param(
     [ValidateSet("dbg","opt")] [string]$Mode = "dbg",
-    [string]$ChromiumSrc = "C:\Users\junwei\workspace\chromium\src",
-    [string]$WebnnDir    = "C:\Users\junwei\workspace\webnn",
-    [string]$MlDrift     = "C:\Users\junwei\workspace\chromium\src\third_party\ml-drift",
+    [string]$ChromiumSrc = "C:\Users\awx_localadmin\workspace\chromium\src",
+    [string]$WebnnDir    = "C:\Users\awx_localadmin\workspace\webnn",
+    [string]$MlDrift     = "C:\Users\awx_localadmin\workspace\chromium\src\third_party\ml-drift",
     # Git-for-Windows bash.exe used as Bazel's --shell_executable. Auto-detected
     # when empty (machine-wide install, then per-user under %LOCALAPPDATA%).
     [string]$Bash        = ""

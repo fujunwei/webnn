@@ -15,9 +15,9 @@
 #   - $ChromiumVersion should match the Chrome build the DLL will be loaded into.
 
 param(
-    [string]$SrcDir           = "C:\Users\junwei\workspace\webnn\_webgpu_dawn_src",
-    [string]$Dest             = "C:\Users\junwei\workspace\webnn\_dawn_prebuilt_win",
-    [string]$ChromiumVersion  = "155.0.8044.0",
+    [string]$SrcDir           = "C:\Users\awx_localadmin\workspace\webnn\_webgpu_dawn_src",
+    [string]$Dest             = "C:\Users\awx_localadmin\workspace\webnn\_dawn_prebuilt_win",
+    [string]$ChromiumVersion  = "155.0.8054.0",
     # Directory containing a python3.exe (depot_tools' bootstrapped CPython works).
     # A `python.exe` alias is created next to it if missing, because Dawn's CMake
     # scripts and some generators invoke bare `python`.
@@ -174,5 +174,22 @@ Write-Host ""
 Write-Host "OK. Prebuilt Dawn tree at $Dest"
 Write-Host "  DLL: $((Get-Item (Join-Path $Dest 'lib\webgpu_dawn.dll')).Length / 1MB) MB"
 Write-Host "  LIB: $((Get-Item (Join-Path $Dest 'lib\webgpu_dawn.lib')).Length / 1MB) MB"
+
+# Under -define=ml_drift_use_dawn_proc=true (README.md SS1.4b), the accelerator
+# links only this thin proc-table trampoline, not lib\webgpu_dawn.dll above. It
+# can't be the plain generated src/dawn/dawn_proc.cpp, though: that file pulls
+# in Dawn's internal (non-public) headers src/dawn/common/Compiler.h,
+# src/utils/assert.h and src/utils/log.h, none of which ship in this include
+# tree. vendor/dawn_proc.cpp is a one-time hand-patched copy (see its own
+# header comment) with those three replaced by trivial local equivalents; copy
+# it in on every run so regenerating the prebuilt tree on a new machine can't
+# silently lose it.
+$vendoredProcCpp = Join-Path $PSScriptRoot "..\vendor\dawn_proc.cpp"
+if (-not (Test-Path $vendoredProcCpp)) {
+    throw "Missing vendored file: $vendoredProcCpp (see README.md section 1.4b)."
+}
+New-Item -ItemType Directory -Force -Path (Join-Path $Dest "src") | Out-Null
+Copy-Item -Force $vendoredProcCpp (Join-Path $Dest "src\dawn_proc.cpp")
+Write-Host "  src\dawn_proc.cpp: vendored from $vendoredProcCpp"
 Write-Host ""
 Write-Host "Set DAWN_PREBUILT_DIR=$Dest before running the litert Bazel build."

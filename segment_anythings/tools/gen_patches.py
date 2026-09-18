@@ -7,7 +7,9 @@ patch per logical change so they can be committed separately.
 
 Each entry is (patch_filename, repo, subject, body, [(path, hunks_or_None)]).
 `hunks` is a list of 0-based hunk indices within that file's diff; None keeps
-every hunk.
+every hunk. Entries listed in COMMITS are sourced from that commit's diff
+against its parent instead of a bare working-tree/staged diff (used for the
+chromium/src checkout, which commits its WebNN changes).
 
 Usage: py gen_patches.py [--check]
 """
@@ -16,13 +18,21 @@ import os
 import subprocess
 import sys
 
-LITERT = r"C:\Users\fujun\workspace\chromium\src\third_party\litert\src"
-MLDRIFT = r"C:\Users\fujun\workspace\chromium\src\third_party\ml-drift"
+LITERT = r"C:\Users\junwei\workspace\chromium\src\third_party\litert\src"
+MLDRIFT = r"C:\Users\junwei\workspace\chromium\src\third_party\ml-drift"
+CHROMIUM = r"C:\Users\junwei\workspace\chromium\src"
 OUT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "patches")
 
 
-def file_diff(repo, path):
-    return subprocess.run(["git", "diff", "--", path], cwd=repo,
+def file_diff(repo, path, commit=None):
+    # The chromium/src checkout commits its WebNN changes (unlike the
+    # litert/ml-drift checkouts, which carry bare working-tree edits), so
+    # those patches are sourced from a specific commit instead.
+    if commit:
+        args = ["git", "diff", commit + "~1", commit, "--", path]
+    else:
+        args = ["git", "diff", "--", path]
+    return subprocess.run(args, cwd=repo,
                           capture_output=True, text=True, check=True).stdout
 
 
@@ -54,147 +64,107 @@ def select_hunks(diff, hunks):
 
 
 PATCHES = [
-    ("24-mldrift-5d-reshape-transpose.patch", MLDRIFT,
-     "ml-drift: handle 5D reshape/transpose attributes",
-     """Completes 5D (BHWDC) reshape/transpose support in ml-drift:
+    ("31-mldrift-winograd-f16-constants.patch", MLDRIFT,
+     "ml-drift: bake Winograd transform constants as FLOAT32 in WGSL",
+     """The 3x3-conv Winograd kernels bake the Bt/At transform matrices into the
+WGSL source via BufferToKernelLanguage, using the input tensor's data type.
+In fp16 mode that yields `const Bt_buffer = array<f16, 36>(...)`, which Dawn
+rejects on devices without the shader-f16 feature ("'f16' type used without
+'f16' extension enabled"). The invalid shader makes the whole command buffer
+invalid, so the dispatch silently never runs and the output buffers stay
+zero-initialized: the fused SAM encoder (single GPU fragment, fp16 mode)
+read back exactly 1048576 zeros with nan=0 and no error.
 
-- add std::any_cast branches for Reshape3DAttributes and
-  Transpose3DAttributes in the legacy GPUOperationFromNode selector;
-- skip 5D identity-reshape in RemoveIdentityReshape to avoid
-  std::bad_any_cast.
+Root-caused with a shader-dump hook (patch 32): the only two WGSL modules
+containing f16 were the Winograd Bt/At kernels. The fix bakes the constants
+as FLOAT32 in all four call sites; the kernels already read them into f32
+arrays, so precision only improves (f16 baking also quantized values like
+sqrt(0.5) to 0.70703125).
 
-NOTE: an earlier revision of this patch also demoted the shape-mismatch
-warning in GpuModelBuilder::UpdateOutputTensors to VLOG(1), on the theory
-that the mismatch was a harmless axis-relabeling artifact. That was wrong
--- the truncated shape is the one installed by SetOutputDescriptor(), so
-the warning marks real data loss. That hunk is deliberately gone; see
-patch 26, which removes the mismatch instead of hiding it.""",
-     [("ml_drift/common/selectors/operation_selector.cc", [1, 2]),
-      ("ml_drift/common/transformations/remove_noop.cc", None)]),
+Verified on the Intel UHD 630 (no shader-f16): new fused model fp16 now
+outputs cosine=0.999977 vs the same model at fp32, and no WGSL validation
+errors remain. The fp32 path was already unaffected (src data type = f32).""",
+     [("ml_drift/common/kernels/winograd.cc", None)]),
 
-    ("25-mldrift-pow-negative-base.patch", MLDRIFT,
-     "ml-drift: guard pow() against negative bases off the OpenCL path",
-     """WGSL, MSL and GLSL all leave pow(x, y) undefined for x < 0; Dawn lowers
-it to exp2(y * log2(x)), which is NaN. The OpenCL path already handles
-this via PowUsingNativePowr, but the shared non-OpenCL path emitted a
-bare pow($1, $2).
+    ("33-litert-bmm-batch-broadcast.patch", LITERT,
+     "litert: broadcast BATCH_MATMUL batch axes in the ML Drift parser",
+     """BatchedMatMulOperationParser assumed every rank-4 BMM has matching
+batch dims ([model_batch, matmul_batch, M, K] on both sides). The SAM
+encoder attention broadcasts instead:
 
-Any decomposed LayerNorm computes pow(x - mean, 2), and x - mean is
-negative for about half of its elements, so a single such node turns the
-whole downstream tensor into NaN once the following MEAN spreads it. On
-the SAM encoder this made all 1048576 output elements NaN; excluding just
-the two POW nodes (delegate indices 1229 and 1248) restored finite output.
+  - B0 broadcast (QK^T): left [14,14,300,64] @ right [1,14,64,14]. The
+    left merges to [1,196,300,64] (H = model batch outer, slot m*B1+k =
+    left[m][k]) but the right stayed [1,14,64,14], so the conv weights
+    indexed only 14 of the 196 batch slots and every block's attention
+    ran against the wrong K. Cosine vs CPU 0.924 -> fixed with a TILE of
+    the right along H (block repeat: slot m*B1+k reads right[k]).
+  - B1 broadcast (attn@V weights, constant): left [14,14,300,64] @ right
+    [14,1,64,14]. A plain TILE cannot express slot m*B1+k = right[m]
+    (TILE repeats blocks, not interleaves), so the constant data is
+    interleaved on the host and baked into the const node as
+    [1,B0*B1,K,N].
 
-The existing pow(x,2) -> x*x lowering does not help here because it lives
-in CreateElementwiseOneRuntimeOneScalar, and this model reaches POW with a
-runtime exponent (an fp16 constant 2.0 behind DEQUANTIZE -> RESHAPE), so
-the two-input kernel is selected instead.
-
-Mirrors PowUsingNativePowr's contract, including its treatment of a
-non-integer exponent with a negative base.""",
-     [("ml_drift/common/kernels/elementwise.cc", None)]),
-
-    ("26-mldrift-rank5-shape-plumbing.patch", MLDRIFT,
-     "ml-drift: allocate rank-5 graph values with their real shape",
-     """GraphFloat32::Value holds a TensorRef<BHWC>, so a frontend with a 5D
-tensor has to drop a dimension to store it. ReserveGraphTensors() then
-allocated e.g. [5,14,5,14,768] as BHWC(5,14,5,14) -- 768x too small --
-and UpdateOutputTensors() overwrote the correct 5D descriptor with the
-truncated one via SetOutputDescriptor(). On the SAM encoder this produced
-100 shape-mismatch warnings and garbage through the whole window-attention
-path.
-
-Adds CreateGpuModelInfo::rank5_shapes, a ValueId -> BHWDC side table that
-frontends able to see the original rank can populate (see the companion
-litert patch). GetTensorDescForValue() then builds a BHWDC/HWDC descriptor
-for those values, mirroring the layout selection already used by
-GpuModelBuilder::AddTensor(b, h, w, d, c, ...).
-
-Also switches the legacy elementwise selector to read shapes from the
-tensor descriptors rather than Value::tensor.shape, which is BHWC and
-therefore truncated; the IR selector already did this. Without it the
-rank-5 broadcast ADDs of SAM's relative-position bias pick the wrong
-broadcast.
-
-The kernels needed no changes -- reshape.cc, transpose.cc and
-elementwise.cc already handle Axis::DEPTH.""",
-     [("ml_drift/common/BUILD", None),
-      ("ml_drift/common/gpu_model.h", None),
-      ("ml_drift/common/gpu_model_util.cc", None),
-      ("ml_drift/common/selectors/operation_selector.cc", [0])]),
-
-    ("27-mldrift-webgpu-readback-timeout.patch", MLDRIFT,
-     "ml-drift: make the WebGPU readback timeout configurable",
-     """MapAsync on the readback buffer only completes once every previously
-queued command has executed, so its timeout is really a budget for the
-whole inference rather than for the copy. The hardcoded 10s is not enough
-for a large graph on an integrated GPU: the SAM encoder needs about 11s
-on an Intel UHD 630 and failed with "Timed out waiting for future: 10s",
-which reads like a hang or an OOM rather than a slow device.
-
-Adds MLD_WEBGPU_READBACK_TIMEOUT_SECONDS. Default behaviour is unchanged.""",
-     [("ml_drift/webgpu/webgpu_api_util.cc", None)]),
-
-    ("28-litert-rank5-shape-collection.patch", LITERT,
-     "litert: recover the real shape of rank-5 values for ml-drift",
-     """BuildFinalModel() records every value's shape through
-ExtractTensorShape(), which drops everything past the 4th dimension
-because GraphFloat32::Value holds a TensorRef<BHWC>. ml-drift then
-allocated rank-5 tensors far too small (see the companion ml-drift patch
-adding CreateGpuModelInfo::rank5_shapes).
-
-Value::tensor.ref is the TFLite tensor index, so the original dims are
-still reachable after BuildFinalModel() returns. Walk the graph values
-once and populate rank5_shapes, guarding against a stale ref by checking
-that the truncation of those dims is what the value actually carries.
-
-This covers every op uniformly rather than each parser separately: on the
-SAM encoder 140 rank-5 tensors are produced by RESHAPE, TRANSPOSE and
-broadcast ADD.""",
-     [("ml_drift_delegate/delegate/BUILD", None),
-      ("ml_drift_delegate/delegate/delegate_kernel.cc", [1, 3])]),
-
-    ("29-litert-transpose-constant-permutation.patch", LITERT,
-     "litert: actually permute constant data for non-4D TRANSPOSE",
-     """TransposeConstantData() bailed out with
-
-    if (perm_data.size() != 4 || elements == 0) { dst_data = src_data; }
-
-so a rank-2 or rank-3 constant TRANSPOSE relabelled the shape but left
-the data untouched. The SAM encoder has 48 rank-2 transposes -- the
-qkv/proj/fc1/fc2 weight matrix of each of the 12 blocks, reached as
-fp16 constant -> DEQUANTIZE -> TRANSPOSE -- so every projection ran
-against a wrongly laid out weight matrix, and the error accumulated per
-block. Cosine against a CPU reference went from 0.401 to 0.859 once
-fixed. A 3x4 repro gives CPU [0,4,8,1,5,9,2,6,10,3,7,11] against GPU
-[0,1,2,...,11].
-
-Introduces BhwcPermFromTflitePerm(), which re-expresses a rank 2/3/4
-TFLite permutation as a BHWC axis permutation following the axis
-placement ExtractTensorShape() uses, and shares it between the constant
-and runtime paths. The runtime path is behaviour-preserving for all three
-ranks; it previously open-coded the same mapping.
-
-Two related fixes fall out of sharing the mapping:
-- the constant path built rank-3 shapes as BHWC(1,D0,D1,D2) while
-  ExtractTensorShape() uses BHWC(D0,1,D1,D2);
-- an unsupported rank now refuses the node so it falls back to CPU,
-  rather than silently shipping untransposed weights.""",
+Any other batch broadcast combination is refused in IsSupported so the
+node falls back to CPU instead of computing wrong results.""",
      [("ml_drift_delegate/tflite/model_builder.cc", None)]),
 
-    ("30-litert-partition-node-logging.patch", LITERT,
-     "litert: log which nodes the GPU delegate actually takes",
-     """The [node-table] dump lists every node considered for delegation. On a
-partially-delegated model that is far more than what runs on the GPU --
-the SAM encoder's decomposed variant offers 1960 nodes and delegates 207
-of them, in 170 fragments -- which makes LITERT_GPU_DEBUG_EXCLUDE_NODES
-experiments look like no-ops when the excluded class was never delegated
-in the first place.
+    ("34-webnn-matmul-batch-broadcast.patch", CHROMIUM,
+     "webnn: broadcast mismatched matmul batch dims before BATCH_MATMUL",
+     """WebNN's matmul validation allows the batch dims (every axis but the
+trailing two) of the two operands to differ as long as they are
+NumPy-broadcastable. GraphBuilderTflite::SerializeMatmul previously passed
+such operands straight through to TFLite's BATCH_MATMUL unchanged. TFLite's
+BATCH_MATMUL spec permits this, and the XNNPACK CPU kernel implements it
+correctly, but not every BATCH_MATMUL backend does: some only handle the
+case where one operand is unbatched (rank 2) and the other is batched, and
+silently mis-compute cases where both operands are batched (rank >= 3, same
+rank) but disagree on one or more batch axes -- see
+33-litert-bmm-batch-broadcast.patch for the concrete GPU-delegate failure
+this caused on the SAM encoder.
 
-Print delegate_params->nodes_to_replace under the existing
-LITERT_GPU_DEBUG_DUMP_NODES flag.""",
-     [("ml_drift_delegate/delegate/delegate_kernel.cc", [0, 2])]),
+Fix this at the graph-builder level instead of per-backend: insert explicit
+BROADCAST_TO ops ahead of BATCH_MATMUL for whichever operand has smaller
+batch dims, so every backend always receives operands with matching batch
+dims. This cannot change the result on backends that already broadcast
+correctly (XNNPACK), it only moves which op performs the replication, and it
+makes 33-litert-bmm-batch-broadcast.patch's GPU-side workaround dead code
+(verified by reverting it and re-running the regression test below through
+the real GPU delegate -- still passes).
+
+Add WebNNGraphImplBackendTest.MatmulBatchDimsBroadcast, covering both an
+outermost batch-axis broadcast and an inner batch-axis broadcast (the
+harder case, since the outer axis already matches at a non-1 value).
+
+Add matching WPT conformance test cases to matmul.https.any.js (float32 and
+float16) for the inner-batch-axis-broadcast shape, which was not previously
+covered by any existing broadcast test case there (all prior "(broadcast)"
+cases only broadcast the outermost batch axis).""",
+     [("services/webnn/tflite/graph_builder_tflite.cc", None),
+      ("services/webnn/webnn_graph_impl_backend_test.cc", None),
+      ("third_party/blink/web_tests/external/wpt/webnn/conformance_tests/matmul.https.any.js",
+       None)]),
+
+    ("35-mldrift-conv-weights-texture-fallback.patch", MLDRIFT,
+     "ml-drift: fall back to global memory when conv weights exceed texture",
+     """GetKernelParamsAdreno checks the kTexturesX4 weights resource size
+against the adapter's image2D limits and falls back to kGlobalMemory,
+but the non-Adreno paths (including WARP and the WebGPU generic path)
+selected kTexturesX4 unconditionally. A different_weights_for_height
+conv with H = 4096 (the SAM window attention's matmul-as-conv) then
+allocates a 16 x 65536 weights texture, which Dawn rejects on adapters
+with 16384^2 limits; the invalid pipeline silently kills the dispatch and
+the output reads back all zeros.
+
+Move the same check into the generic GetKernelParams tail so every path
+degrades to global memory instead of emitting an invalid texture.""",
+     [("ml_drift/common/kernels/conv_generic.cc", None)]),
 ]
+
+# Patches sourced from a specific chromium/src commit instead of a bare
+# working-tree/staged diff (that repo commits its WebNN changes).
+COMMITS = {
+    "34-webnn-matmul-batch-broadcast.patch": "c6367c7848",
+}
 
 
 def main():
@@ -204,9 +174,10 @@ def main():
     args = ap.parse_args()
 
     for name, repo, subject, body, files in PATCHES:
+        commit = COMMITS.get(name)
         parts = [subject, "", body, ""]
         for path, hunks in files:
-            d = file_diff(repo, path)
+            d = file_diff(repo, path, commit)
             if not d.strip():
                 raise SystemExit("no diff for %s in %s" % (path, repo))
             parts.append(select_hunks(d, hunks))

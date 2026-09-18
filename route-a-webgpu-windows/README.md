@@ -4,7 +4,7 @@
 >
 > 本 bundle 覆盖 Linux 方案 `../route-a-webgpu/` 的 Windows 移植。
 >
-> 最近一次全流程验证：Chromium `155.0.8044.0`（2026-09-06），litert `dc32e93`，ml-drift `b29199f`。
+> 最近一次全流程验证：Chromium `155.0.8054.0`（2026-09-17），litert `dc32e93`，ml-drift `b29199f`，含 Dawn Proc 直通改造（见 §1.4b）。
 
 ---
 
@@ -35,8 +35,8 @@ Windows 自带的 `python.exe` 是仅会弹出 Microsoft Store 页面的"应用�
 换机必改路径。示例（本机）：
 
 ```powershell
-$CR      = "C:\Users\junwei\workspace\chromium\src"
-$WEBNN   = "C:\Users\junwei\workspace\webnn"                      # 本 bundle 的父目录
+$CR      = "C:\Users\awx_localadmin\workspace\chromium\src"
+$WEBNN   = "C:\Users\awx_localadmin\workspace\webnn"                      # 本 bundle 的父目录
 $LITERT  = "$CR\third_party\litert\src"
 $MLDRIFT = "$CR\third_party\ml-drift"
 $BUNDLE  = "$WEBNN\route-a-webgpu-windows"
@@ -59,8 +59,11 @@ Chromium `.obj` 是 LLVM bitcode，只能用 `lld-link.exe /lib` 打包。
 & "$BUNDLE\scripts\build_dawn.ps1" `
     -SrcDir           "$WEBNN\_webgpu_dawn_src" `
     -Dest             "$WEBNN\_dawn_prebuilt_win" `
-    -ChromiumVersion  "155.0.8044.0"
-# 期望：_dawn_prebuilt_win\{include,lib}\，其中 lib\webgpu_dawn.dll ~10 MB。耗时 30-60 分钟。
+    -ChromiumVersion  "155.0.8054.0"
+# 期望：_dawn_prebuilt_win\{include,lib,src}\，其中 lib\webgpu_dawn.dll ~10 MB，
+# src\dawn_proc.cpp 是脚本自动从 $BUNDLE\vendor\dawn_proc.cpp 拷过来的（见 §1.4b）。
+# 耗时 30-60 分钟（几乎都花在 lib\webgpu_dawn.dll 上；-define=ml_drift_use_dawn_proc=true
+# 下这个 DLL 实际不会被加速器链接，见 §1.4b 后的说明，但目前仍需要跑这一步来拿 include\ 头文件）。
 ```
 
 > **Dawn 分支滞后提示**：Dawn 只有在对应 Chromium milestone 切分支后才会出现 `chromium/<BUILD>` 分支，追主线 Chromium 时常常比 Dawn 新 1-2 个 build。脚本会自动查询 `dawn.googlesource.com` 上已发布的分支列表，找不到精确匹配时自动回退到「不超过所需版本的最新分支」，并打印提示，不需要手工改版本号。
@@ -98,6 +101,8 @@ git apply "$BUNDLE\patches\06-chrome-release-webnn-dlls.patch"               # �
 Pop-Location
 ```
 
+> **patch 05 从 155.0.8054.0 起已不需要**：该版本的 `webnn_sandbox_init.cc` 已经用绝对路径 `LoadLibrary`，patch 05 会 `git apply` 失败（或 no-op）。升级到这个版本或更新时，先 `git apply --check` 探测，失败就跳过 05，只打 06。见 §5 第 14 条。
+
 **可选**（不影响 GPU delegate 是否工作，纯调试辅助）：
 
 ```powershell
@@ -117,6 +122,32 @@ patch 00 里的绝对路径是本机的，换机必改：
 #   -march=sierraforest                        -> 本机 CPU 的合适值
 ```
 
+> **patch 02（`WORKSPACE` 的 `local_repository(name = "ml_drift", ...)`）也硬编码了本机绝对路径**，同样换机必改——否则 Bazel 会安安静静地从旧机器/旧账号的 ml-drift 检出读取 `@ml_drift`，本地对 `ml_drift/webgpu/BUILD` 的任何编辑都不会生效（也不会报错）。踩过这个坑的完整排查过程见 §5 第 16 条。
+
+### 1.4b Dawn Proc 直通（代码评审意见，2026-09-17）
+
+评审者 Reilly 指出：加速器 DLL 不应静态链接一份独立的 `webgpu_dawn.dll`（Dawn Native 风格，直接导出 `wgpu*` 符号），而应该改走 Dawn Proc 风格——只编译 Dawn 自己生成的 `dawn_proc.cpp`（`wgpu*` 变成经由运行时可重绑定的全局 `DawnProcTable` 转发的 trampoline），这样加速器才能在运行时通过 `dawnProcSetProcs()` 绑定到 **Chromium 自己的** GPU 进程 Dawn 实例，而不是静默地跑一份自己的、独立的 Dawn/WebGPU 实例。原先 `ML_DRIFT_USE_DAWN_PROC` 这个开关一直没被设置，`graph_impl_litert.cc` 传进来的 `kWebGpuProcs`（Chromium 的 `DawnProcTable*`）在 `delegate_webgpu.cc` 里就是死代码。
+
+修复内容：
+
+- `third_party/dawn/workspace.bzl` 的 Windows `_WIN_ROOT_BUILD` 模板新增 `dawn_proc_lib`（编译 vendor 进来的 `src/dawn_proc.cpp`，见下）和 `libdawn_proc` alias；`webgpu_dawn`/`dawn_headers`/`webgpu_headers` 改为纯 headers-only + `cc_import`，不再默认拉近 `.dll`。
+- vendor 了一份 Dawn 自己生成的 `dawn_proc.cpp` 到 `$BUNDLE/vendor/dawn_proc.cpp`，替换了它引用的 3 个 Dawn 内部头（`Compiler.h`/`assert.h`/`log.h`）为本地等价实现（`DAWN_NO_SANITIZE` 宏、`DAWN_CHECK` 宏、`dawn::ErrorLog()`）。`scripts/build_dawn.ps1` 每次运行都会把它拷进 `_dawn_prebuilt_win/src/dawn_proc.cpp`（`prebuilt_dawn` repo rule 的 Windows 分支会把这个 `src/` 目录一起拷进 `@dawn` 外部仓库），换机重新跑一遍 setup 也不会丢这份手工 patch。
+- `ml_drift/webgpu/BUILD` 的 `:environment`、`:webgpu_headers` 等目标，以及 `ml_drift_delegate/delegate/BUILD` 的 `delegate_webgpu` 目标，把原本无条件的 `@dawn//:webgpu_dawn` 依赖改成 `select()`：
+  ```python
+  select({
+      ":ml_drift_use_dawn_proc": ["@dawn//:libdawn_proc"],
+      "//conditions:default": ["@dawn//:webgpu_dawn"],
+  })
+  ```
+- `.bazelrc.user` 加一行 `build:crcxx_win --define=ml_drift_use_dawn_proc=true` 触发 `config_setting`（定义在 `ml_drift/webgpu/BUILD`）。
+- `delegate_webgpu.cc` 里 `#if defined(ML_DRIFT_USE_DAWN_PROC)` 分支会从 LiteRT 的 `kLiteRtEnvOptionTagWebGpuProcs` 读出 Chromium 传入的 `DawnProcTable*` 并调用 `dawnProcSetProcs()`。
+
+**验证**：修好后 `libLiteRtWebGpuAccelerator.dll` 的 PE import table 里彻底没有 `webgpu_dawn.dll`（`dumpbin /DEPENDENTS` 确认），linker `.params` 里只剩 `/WHOLEARCHIVE:.../dawn_proc_lib.lib`（不再同时有 `webgpu_dawn.lib`），且 §3 的 GPU 推理测试正常拿到 `readTensor result=[11,22,33,44]`。
+
+> ⚠️ **踩过的坑**：`WORKSPACE` 里 `local_repository(name = "ml_drift", path = "...")` 是按机器硬编码的绝对路径（同 §1.4 的 `.bazelrc.user`）。如果这个 `path` 还指着别的机器/账号的 ml-drift 检出（例如换账号复制 bundle 时忘记改这一行），Bazel 会安安静静地从那个旧目录读 `@ml_drift`——对本地这份 `ml_drift/webgpu/BUILD` 的任何编辑都会被完全忽略且不报错，只会在链接期表现为奇怪的重复符号错误。换机 / 换检出目录时，`WORKSPACE` 里所有 `local_repository`/硬编码路径都要连带检查，不能只改 `.bazelrc.user`。
+
+> **`scripts/build_dawn.ps1` 在 §1.4b 之后还需要吗？需要，不能删**——`prebuilt_dawn` repo rule（§1.4b 改过的 `workspace.bzl`）不管选没选 `ml_drift_use_dawn_proc`，都无条件要求 `$DAWN_PREBUILT_DIR` 下有 `include/`、`lib/`、`src/` 三个目录都存在，脚本仍是唯一产出 `include/`（Dawn 头文件）和 `lib/webgpu_dawn.dll` 的地方。已知的低效之处：`ml_drift_use_dawn_proc=true` 下加速器根本不链接 `lib/webgpu_dawn.dll`（只用 `include/` 里的头文件 + `src/dawn_proc.cpp`），所以脚本里 30-60 分钟的 CMake 编译有一部分是在编一个现在用不上的 DLL。评估过把这一步换成直接拷贝 Chromium 自己 `out\<dir>\gen\third_party\dawn\include\` 的产物，但 Chromium 自己的 GN 构建只生成一个精简子集（缺 `dawn/dawn_proc.h`、`webgpu/webgpu.h`、`dawn/native/*.h`、`dawn/wire/WireClient.h` 等完整 Dawn "SDK" 里的大量头文件），逐一核对替换的风险大于收益，故保留现状；只把 `dawn_proc.cpp` 这一个必须手工 patch 的文件迁移成了脚本自动从 `vendor/` 拷贝（见上）。
+
 ---
 
 ## 2. 编译加速器 DLL
@@ -124,7 +155,7 @@ patch 00 里的绝对路径是本机的，换机必改：
 **首次编译**（只为了生成工具链配置），预期会因 hermetic include 检查失败：
 
 ```powershell
-& "$BUNDLE\scripts\build_accelerator_dll.ps1" -Mode opt -ChromiumSrc $CR -WebnnDir $WEBNN -MlDrift $MLDRIFT
+& "$BUNDLE\scripts\build_accelerator_dll.ps1" -Mode opt -ChromiumSrc $CR -MlDrift $MLDRIFT
 ```
 
 **打 Bazel 生成的 toolchain BUILD**（一次性；`bazel clean --expunge` 后要重跑）：
@@ -139,7 +170,8 @@ python "$BUNDLE\scripts\patch_bazel_toolchain.py"
 & "$BUNDLE\scripts\build_accelerator_dll.ps1" -Mode dbg
 
 & "$BUNDLE\scripts\build_accelerator_dll.ps1" -Mode opt
-# 期望产出：$LITERT\bazel-bin\litert\runtime\accelerators\gpu\libLiteRtWebGpuAccelerator.dll（opt ~8.5 MB）
+# 期望产出：$LITERT\bazel-bin\litert\runtime\accelerators\gpu\libLiteRtWebGpuAccelerator.dll
+# （opt ~15 MB，含静态链入的 clang_rt.builtins，见 §5 第 15 条；早期不含该 linkopt 的构建约 8.5 MB）
 ```
 
 **验证 ABI**（必须用 Chromium libc++，不能用 MSVC STL）：
@@ -167,9 +199,9 @@ $text = [System.Text.Encoding]::ASCII.GetString([System.IO.File]::ReadAllBytes($
 ### 3.1 dev 目录直接跑（推荐迭代方式）
 
 ```powershell
-& "$BUNDLE\scripts\deploy_to_chrome.ps1" -ChromeOutDir "$CR\out\Release" -Mode opt -ChromiumSrc $CR -WebnnDir $WEBNN
+& "$BUNDLE\scripts\deploy_to_chrome.ps1" -ChromeOutDir "$CR\out\Release" -Mode opt -ChromiumSrc $CR
 
-& "$BUNDLE\scripts\deploy_to_chrome.ps1" -ChromeOutDir "$CR\out\upstream_bots_debug" -Mode dbg -ChromiumSrc $CR -WebnnDir $WEBNN
+& "$BUNDLE\scripts\deploy_to_chrome.ps1" -ChromeOutDir "$CR\out\upstream_bots_debug" -Mode dbg -ChromiumSrc $CR
 
 & "$CR\out\Release\chrome.exe" `
     --no-sandbox --enable-features=WebMachineLearningNeuralNetwork `
@@ -189,7 +221,7 @@ Remove-Item -Recurse -Force -ErrorAction SilentlyContinue `
     "$Out\gen\chrome\installer\mini_installer\mini_installer\Chrome-bin"
 
 # 2) stage DLL + 打包（脚本内部做 Rename-Item; Copy-Item 覆盖 + ninja mini_installer）
-& "$BUNDLE\scripts\build_mini_installer.ps1" -ChromeOutDir "$Out" -ChromiumSrc $CR -WebnnDir $WEBNN
+& "$BUNDLE\scripts\build_mini_installer.ps1" -ChromeOutDir "$Out" -ChromiumSrc $CR
 
 # 3) 自检 chrome.7z 里有两个自制 DLL
 tar -tvf "$Out\chrome.7z" | Select-String "libLiteRt|webgpu_dawn"
@@ -224,9 +256,12 @@ route-a-webgpu-windows/
 │   ├── 06-chrome-release-webnn-dlls.patch                       # 应用到 Chromium 仓：mini_installer 打包 webgpu_dawn.dll
 │   ├── 07-serialization-weight-cache-python3-genrule.patch      # 应用到 litert 仓：genrule 直接调 $(PYTHON3)，绕开 py_binary 深层 runfiles 触发的 Windows MAX_PATH 限制
 │   └── 90-ml-drift-log-unsupported-op-counts.patch              # 可选：应用到 litert 仓，按 opcode 统计被拒绝算子数量的调试日志
+├── vendor/
+│   └── dawn_proc.cpp               # 1.4b: 手工 patch 过的 Dawn dawn_proc.cpp（去掉 3 个 Dawn 内部头依赖），
+│                                    #       build_dawn.ps1 每次运行都会拷进 _dawn_prebuilt_win/src/
 └── scripts/
     ├── build_libcxx_lib.ps1        # 1.1: 打包 libc++.lib
-    ├── build_dawn.ps1              # 1.2: 编 webgpu_dawn.dll（含 python.exe 别名探测 + Dawn 分支自动回退）
+    ├── build_dawn.ps1              # 1.2: 编 webgpu_dawn.dll + 拷贝 vendor/dawn_proc.cpp（含 python.exe 别名探测 + Dawn 分支自动回退）
     ├── patch_bazel_toolchain.py    # 2:   打 Bazel 自动生成的 toolchain BUILD
     ├── build_accelerator_dll.ps1   # 2:   bazel build ...（含代理自动注入 + bash.exe 自动探测）
     ├── deploy_to_chrome.ps1        # 3.1: 拷 DLL 到 chrome.exe 目录（dev 迭代用）
@@ -300,7 +335,10 @@ route-a-webgpu-windows/
     - `compiled_model.cc` 里 `OptimizeMemoryForLargeTensors` 相关改动：该调用点已从上游代码里整体移除。
     - `graph_builder_tflite.cc` 的 `custom_call.LayerNorm` 融合算子：已完整合入 Chromium 上游（`SerializeLayerNormalizationAsCustomCall` 等）。
     - `delegate_webgpu.cc` 的 farmhash include 路径 + pipeline-cache 回调禁用：farmhash include 已用回上游路径；`webgpu-dawn-binaries` 现在编出的 Dawn 自带 `SetDawnLoad/StoreCacheDataCallback`，无需再禁用 pipeline cache。
+    - **（2026-09-12 新增）`webnn_sandbox_init.cc` 的绝对路径 `LoadLibrary`（原 patch 05）**：Chromium `155.0.8054.0` 检出里这段逻辑已经是上游代码的一部分，`git apply patches\05-webnn-sandbox-init-full-dll-path.patch` 会失败；跳过即可，不影响 GPU delegate 是否工作。
     升级后先按 §1.3 只打"确实还需要"的 patch，`git apply --check` 失败再对照本条判断是否已被上游吸收。
+15. **`lld-link: error: undefined symbol: __mulsc3`（链接期，不是 hermetic-include 报错）** — 出现在链接 `libLiteRtWebGpuAccelerator.dll` 的最后一步，被引用方是 tflite 内置的 `mul` kernel 对 `std::complex<float>` 做乘法（`EvalMul` / `BroadcastMul6DSlow` 等）。`__mulsc3`（以及同族的 `__muldc3`/`__divsc3`/`__divdc3`，复数乘除法的软件实现）是 clang/compiler-rt 的 builtin helper，既不在 Chromium 的 `libc++.lib` 里，也不在 `msvcprt.lib` 里，MSVC 的 STL/CRT 从不需要它们（MSVC 用不同的复数乘法展开方式）。根治：把 Chromium 自带的 `third_party\llvm-build\Release+Asserts\lib\clang\24\lib\windows\clang_rt.builtins-x86_64.lib` 作为 `--linkopt`/`--host_linkopt` 加进 `.bazelrc.user`（放在 `libc++.lib`/`msvcprt.lib` 之后即可，lld-link 对 `.lib` 顺序不敏感）。若升级 clang 后路径里的 `24`（clang 大版本号）变了，按新版本号调整该路径。
+16. **`lld-link: error: duplicate symbol: wgpuAdapterAddRef`（及一堆同类 `wgpu*` 符号）** — 打开 §1.4b 的 Dawn Proc 直通后才会出现。表面看像是 `select()` 语义有问题（`ml_drift/webgpu/BUILD` 的 `:environment` 和 `ml_drift_delegate/delegate/BUILD` 的 `delegate_webgpu` 在同一次 build 里对同一个 `config_setting` 解析出了不同分支），但真正原因是 **`WORKSPACE` 里 `local_repository(name = "ml_drift", path = "...")` 这个路径没跟着换机器/换账号一起改**——Bazel 实际读的是 `path` 指向的那份（旧的、没打 §1.4b 补丁的）`ml_drift/webgpu/BUILD`，而你以为自己在编辑的那份文件其实在另一个物理目录，编辑完全没生效。排查方法：`bazel cquery <target> --output=build --check_visibility=false` 看 `generator_location` 和 resolved deps 里的 execroot 路径，或者直接去 `<output_base>/external/ml_drift/...` 读 Bazel 实际用的那份文件，跟本地编辑的版本比对。根治：`WORKSPACE` 里所有 `local_repository`/硬编码绝对路径都要按 §1.4 的方式换成本机路径，不能假设只有 `.bazelrc.user` 需要改。
 
 ---
 

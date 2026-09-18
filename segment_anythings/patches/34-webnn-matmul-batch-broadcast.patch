@@ -1,0 +1,254 @@
+webnn: broadcast mismatched matmul batch dims before BATCH_MATMUL
+
+WebNN's matmul validation allows the batch dims (every axis but the
+trailing two) of the two operands to differ as long as they are
+NumPy-broadcastable. GraphBuilderTflite::SerializeMatmul previously passed
+such operands straight through to TFLite's BATCH_MATMUL unchanged. TFLite's
+BATCH_MATMUL spec permits this, and the XNNPACK CPU kernel implements it
+correctly, but not every BATCH_MATMUL backend does: some only handle the
+case where one operand is unbatched (rank 2) and the other is batched, and
+silently mis-compute cases where both operands are batched (rank >= 3, same
+rank) but disagree on one or more batch axes -- see
+33-litert-bmm-batch-broadcast.patch for the concrete GPU-delegate failure
+this caused on the SAM encoder.
+
+Fix this at the graph-builder level instead of per-backend: insert explicit
+BROADCAST_TO ops ahead of BATCH_MATMUL for whichever operand has smaller
+batch dims, so every backend always receives operands with matching batch
+dims. This cannot change the result on backends that already broadcast
+correctly (XNNPACK), it only moves which op performs the replication, and it
+makes 33-litert-bmm-batch-broadcast.patch's GPU-side workaround dead code
+(verified by reverting it and re-running the regression test below through
+the real GPU delegate -- still passes).
+
+Add WebNNGraphImplBackendTest.MatmulBatchDimsBroadcast, covering both an
+outermost batch-axis broadcast and an inner batch-axis broadcast (the
+harder case, since the outer axis already matches at a non-1 value).
+
+Add matching WPT conformance test cases to matmul.https.any.js (float32 and
+float16) for the inner-batch-axis-broadcast shape, which was not previously
+covered by any existing broadcast test case there (all prior "(broadcast)"
+cases only broadcast the outermost batch axis).
+
+diff --git a/services/webnn/tflite/graph_builder_tflite.cc b/services/webnn/tflite/graph_builder_tflite.cc
+index 268ed62b99..4fa767a333 100644
+--- a/services/webnn/tflite/graph_builder_tflite.cc
++++ b/services/webnn/tflite/graph_builder_tflite.cc
+@@ -8289,7 +8289,62 @@ auto GraphBuilderTflite::SerializeMatmul(const mojom::Matmul& matmul)
+   ASSIGN_OR_RETURN(const TensorInfo output_tensor_info,
+                    SerializeOutputTensorInfo(matmul.output_operand_id));
+ 
+-  return SerializeMatmulOperation(a_tensor_info.index, b_tensor_info.index,
++  TensorIndex a_tensor_index = a_tensor_info.index;
++  TensorIndex b_tensor_index = b_tensor_info.index;
++
++  // WebNN's matmul allows the batch dims (every axis but the trailing two)
++  // of `a` and `b` to differ and broadcast against each other following
++  // NumPy rules. TFLite's BATCH_MATMUL spec allows this too and XNNPACK's
++  // CPU kernel implements it correctly, but not every BATCH_MATMUL backend
++  // does: some only handle the case where one operand is unbatched (rank
++  // 2) and the other is batched, and silently mis-compute the case where
++  // both operands are batched (rank >= 3, same rank) but disagree on one
++  // or more batch axes. Materialize the broadcast explicitly here with
++  // BROADCAST_TO so every backend always sees matching batch dims on both
++  // operands; this cannot change the result (XNNPACK already computes the
++  // same broadcast), it only moves which op performs the replication.
++  const std::vector<int32_t>& a_dims = a_tensor_info.dimensions;
++  const std::vector<int32_t>& b_dims = b_tensor_info.dimensions;
++  if (a_dims.size() >= 3 && a_dims.size() == b_dims.size() &&
++      !std::equal(a_dims.begin(), a_dims.end() - 2, b_dims.begin())) {
++    const size_t batch_rank = a_dims.size() - 2;
++    std::vector<int32_t> batch_dims(batch_rank);
++    for (size_t i = 0; i < batch_rank; ++i) {
++      batch_dims[i] = std::max(a_dims[i], b_dims[i]);
++    }
++    if (!std::ranges::equal(a_dims.begin(), a_dims.begin() + batch_rank,
++                            batch_dims.begin(), batch_dims.end())) {
++      std::vector<int32_t> a_broadcast_dims = batch_dims;
++      a_broadcast_dims.insert(a_broadcast_dims.end(), a_dims.end() - 2,
++                              a_dims.end());
++      ASSIGN_OR_RETURN(const TensorIndex broadcast_a_tensor_index,
++                       SerializeTemporaryTensorWithByteSizeCheck(
++                           a_broadcast_dims, a_tensor_info.data_type));
++      ASSIGN_OR_RETURN(
++          const OperatorOffset broadcast_a_op,
++          SerializeBroadcastToOperation(a_tensor_index, a_broadcast_dims,
++                                        broadcast_a_tensor_index));
++      operators_.emplace_back(broadcast_a_op);
++      a_tensor_index = broadcast_a_tensor_index;
++    }
++    if (!std::ranges::equal(b_dims.begin(), b_dims.begin() + batch_rank,
++                            batch_dims.begin(), batch_dims.end())) {
++      std::vector<int32_t> b_broadcast_dims = batch_dims;
++      b_broadcast_dims.insert(b_broadcast_dims.end(), b_dims.end() - 2,
++                              b_dims.end());
++      ASSIGN_OR_RETURN(const TensorIndex broadcast_b_tensor_index,
++                       SerializeTemporaryTensorWithByteSizeCheck(
++                           b_broadcast_dims, b_tensor_info.data_type));
++      ASSIGN_OR_RETURN(
++          const OperatorOffset broadcast_b_op,
++          SerializeBroadcastToOperation(b_tensor_index, b_broadcast_dims,
++                                        broadcast_b_tensor_index));
++      operators_.emplace_back(broadcast_b_op);
++      b_tensor_index = broadcast_b_tensor_index;
++    }
++  }
++
++  return SerializeMatmulOperation(a_tensor_index, b_tensor_index,
+                                   output_tensor_info.index);
+ }
+ 
+diff --git a/services/webnn/webnn_graph_impl_backend_test.cc b/services/webnn/webnn_graph_impl_backend_test.cc
+index f406ab8985..fb06a69308 100644
+--- a/services/webnn/webnn_graph_impl_backend_test.cc
++++ b/services/webnn/webnn_graph_impl_backend_test.cc
+@@ -414,6 +414,7 @@ void WebNNGraphImplBackendTest::SetUp() {
+       // "FuseStandaloneActivationIntoInstanceNormalization",
+       "FuseStandaloneActivationIntoLayerNormalization",
+       "FuseStandaloneOperationsIntoMatmul",
++      "MatmulBatchDimsBroadcast",
+       // "MultipleOutputsCanNotFuseStandaloneActivation",
+   });
+ 
+@@ -2816,6 +2817,55 @@ TEST_P(WebNNGraphImplBackendTest, FuseStandaloneOperationsIntoMatmul) {
+   }
+ }
+ 
++// Test building and computing a graph with a matmul whose operands have
++// mismatched-but-broadcastable batch dims (rank >= 3, same rank, NumPy-style
++// broadcasting on every axis but the trailing two), as WebNN's matmul
++// validation explicitly allows. This exercises the BROADCAST_TO
++// normalization inserted by SerializeMatmul so that TFLite backends that
++// only implement rank-2-vs-rank-N matmul broadcasting (not full batch-dims
++// broadcasting) still see equal batch dims on both operands.
++TEST_P(WebNNGraphImplBackendTest, MatmulBatchDimsBroadcast) {
++  // Broadcast on the outermost batch axis (b's leading dim is 1).
++  {
++    MatmulTester<float>{
++        .input_a = {.type = OperandDataType::kFloat32,
++                    .dimensions = {2, 2, 2, 2},
++                    .values = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14,
++                               15, 16}},
++        .input_b = {.type = OperandDataType::kFloat32,
++                    .dimensions = {1, 2, 2, 2},
++                    .values = {1, 0, 0, 1, 0, 1, 1, 0}},
++        .output = {.type = OperandDataType::kFloat32,
++                   .dimensions = {2, 2, 2, 2},
++                   .values = {1, 2, 3, 4, 6, 5, 8, 7, 9, 10, 11, 12, 14, 13,
++                              16, 15}}}
++        .TestFusion(*this,
++                    /*permutation_a*/ std::nullopt,
++                    /*permutation_b*/ std::nullopt,
++                    /*fusible_operation*/ std::nullopt);
++  }
++
++  // Broadcast on an inner batch axis (b's second dim is 1).
++  {
++    MatmulTester<float>{
++        .input_a = {.type = OperandDataType::kFloat32,
++                    .dimensions = {2, 2, 2, 2},
++                    .values = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14,
++                               15, 16}},
++        .input_b = {.type = OperandDataType::kFloat32,
++                    .dimensions = {2, 1, 2, 2},
++                    .values = {1, 0, 0, 1, 0, 1, 1, 0}},
++        .output = {.type = OperandDataType::kFloat32,
++                   .dimensions = {2, 2, 2, 2},
++                   .values = {1, 2, 3, 4, 5, 6, 7, 8, 10, 9, 12, 11, 14, 13,
++                              16, 15}}}
++        .TestFusion(*this,
++                    /*permutation_a*/ std::nullopt,
++                    /*permutation_b*/ std::nullopt,
++                    /*fusible_operation*/ std::nullopt);
++  }
++}
++
+ // Test building and computing a graph with two inputs and two constant in
+ // the following topology.
+ //    [input_a] [constant_a] [input_b] [constant_b]
+diff --git a/third_party/blink/web_tests/external/wpt/webnn/conformance_tests/matmul.https.any.js b/third_party/blink/web_tests/external/wpt/webnn/conformance_tests/matmul.https.any.js
+index f4c2e4452e..01d8c594f0 100644
+--- a/third_party/blink/web_tests/external/wpt/webnn/conformance_tests/matmul.https.any.js
++++ b/third_party/blink/web_tests/external/wpt/webnn/conformance_tests/matmul.https.any.js
+@@ -334,6 +334,42 @@ const matmulTests = [
+       }
+     }
+   },
++  {
++    // Broadcasts an inner batch axis of inputB (dim 1) while the outer
++    // batch axis (dim 0) already matches inputA and is not 1. This is
++    // distinct from the previous case, which broadcasts the outermost
++    // batch axis: some backends implement batch-dims broadcasting by
++    // reshaping the smaller-batch operand's leading axes down to a single
++    // merged batch axis and tiling/repeating it, which is only correct
++    // when the mismatched axis is outermost.
++    'name':
++        'matmul float32 4D and 4D (broadcast an inner batch dimension) tensors',
++    'graph': {
++      'inputs': {
++        'inputA': {
++          'data': [
++            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16
++          ],
++          'descriptor': {shape: [2, 2, 2, 2], dataType: 'float32'}
++        },
++        'inputB': {
++          'data': [1, 0, 0, 1, 0, 1, 1, 0],
++          'descriptor': {shape: [2, 1, 2, 2], dataType: 'float32'}
++        }
++      },
++      'operators': [{
++        'name': 'matmul',
++        'arguments': [{'a': 'inputA'}, {'b': 'inputB'}],
++        'outputs': 'output'
++      }],
++      'expectedOutputs': {
++        'output': {
++          'data': [1, 2, 3, 4, 5, 6, 7, 8, 10, 9, 12, 11, 14, 13, 16, 15],
++          'descriptor': {shape: [2, 2, 2, 2], dataType: 'float32'}
++        }
++      }
++    }
++  },
+   {
+     'name': 'matmul float32 4D and 3D tensors',
+     'graph': {
+@@ -876,6 +912,38 @@ const matmulTests = [
+       }
+     }
+   },
++  {
++    // See the float32 counterpart above for why this case (broadcasting an
++    // inner batch axis while an outer, already-matching batch axis is not
++    // 1) is distinct from the outermost-batch-axis broadcast case.
++    'name':
++        'matmul float16 4D and 4D (broadcast an inner batch dimension) tensors',
++    'graph': {
++      'inputs': {
++        'inputA': {
++          'data': [
++            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16
++          ],
++          'descriptor': {shape: [2, 2, 2, 2], dataType: 'float16'}
++        },
++        'inputB': {
++          'data': [1, 0, 0, 1, 0, 1, 1, 0],
++          'descriptor': {shape: [2, 1, 2, 2], dataType: 'float16'}
++        }
++      },
++      'operators': [{
++        'name': 'matmul',
++        'arguments': [{'a': 'inputA'}, {'b': 'inputB'}],
++        'outputs': 'output'
++      }],
++      'expectedOutputs': {
++        'output': {
++          'data': [1, 2, 3, 4, 5, 6, 7, 8, 10, 9, 12, 11, 14, 13, 16, 15],
++          'descriptor': {shape: [2, 2, 2, 2], dataType: 'float16'}
++        }
++      }
++    }
++  },
+   {
+     'name': 'matmul float16 4D and 3D tensors',
+     'graph': {

@@ -19,10 +19,15 @@ table there when adding a patch.
 | Patches | Repo |
 |---|---|
 | `01`–`13`, `28`–`30` (prefix `litert`) | `third_party\litert\src` |
-| `22`–`27` (prefix `mldrift`) | `third_party\ml-drift` |
+| `22`–`27`, `31`, `32`, `35` (prefix `mldrift`) | `third_party\ml-drift` |
+| `34` (prefix `webnn`) | `chromium\src` itself |
 
-Both are their own git checkouts. Apply and commit in numeric order **within
-each repo**.
+`litert/src` and `ml-drift` are their own git checkouts carrying bare
+working-tree edits; apply and commit in numeric order **within each repo**.
+`34` is different: it's a normal commit already made directly in the
+`chromium\src` checkout (see `git log --oneline -- services/webnn`) and the
+`.patch` file here is only a snapshot for reference/tracking, not something
+you `git apply`.
 
 ## Status
 
@@ -78,6 +83,13 @@ git apply --check --reverse <patch>
 | 28 | `ml_drift_delegate/delegate/BUILD`, `delegate_kernel.cc` | recover real rank-5 shapes into `CreateGpuModelInfo::rank5_shapes` |
 | 29 | `ml_drift_delegate/tflite/model_builder.cc` | **actually permute constant data for rank-2/3 TRANSPOSE** |
 | 30 | `ml_drift_delegate/delegate/delegate_kernel.cc` | log the nodes the delegate really takes |
+| 33 | `ml_drift_delegate/tflite/model_builder.cc` | **broadcast BATCH_MATMUL batch axes** — B0 broadcast via TILE along H; B1 broadcast (constant right) via host-side interleave baked into the const node; other broadcast combos refuse and fall back to CPU. **Superseded by `34`, see note below.** |
+
+### chromium/src
+
+| # | File(s) | Change |
+|---|---|---|
+| 34 | `services/webnn/tflite/graph_builder_tflite.cc`, `services/webnn/webnn_graph_impl_backend_test.cc`, `third_party/blink/web_tests/external/wpt/webnn/conformance_tests/matmul.https.any.js` | **broadcast mismatched matmul batch dims before BATCH_MATMUL, at the graph-builder level** — `SerializeMatmul` now inserts explicit `BROADCAST_TO` ops so every TFLite backend sees matching batch dims on both matmul operands, making `33`'s GPU-delegate workaround dead code. Landed as commit `c6367c7848`; see [33-bmm-batch-broadcast.zh.md](33-bmm-batch-broadcast.zh.md) §10 for the design writeup. |
 
 ### ml-drift
 
@@ -91,6 +103,7 @@ git apply --check --reverse <patch>
 | 27 | `ml_drift/webgpu/webgpu_api_util.cc` | `MLD_WEBGPU_READBACK_TIMEOUT_SECONDS` |
 | 31 | `common/kernels/winograd.cc` | **bake Winograd Bt/At constants as FLOAT32** — f16 WGSL on devices without shader-f16 silently kills the whole dispatch (SAM fp16 all-zeros) |
 | 32 | `webgpu/webgpu_api_util.cc` | debug hook: `MLD_WEBGPU_SHADER_DUMP_DIR` dumps WGSL sources that mention f16 |
+| 35 | `common/kernels/conv_generic.cc` | **fall back to `kGlobalMemory` when conv weights exceed image2D limits** — the check existed only in `GetKernelParamsAdreno`; WARP/WebGPU generic paths emitted an invalid 16×65536 weights texture (SAM window attention) that silently zeroed the output |
 
 ## Notes
 
@@ -108,5 +121,27 @@ git apply --check --reverse <patch>
 - `29` fixes a silent-corruption bug, not a crash: a rank-2 constant TRANSPOSE
   used to relabel the shape and copy the data unpermuted. Worth prioritizing if
   you are cherry-picking.
+- **`33` is superseded by `34`, a fix in Chromium's own WebNN→TFLite graph
+  builder** (`services/webnn/tflite/graph_builder_tflite.cc`,
+  `SerializeMatmul`), not in this third-party checkout. WebNN's matmul
+  validation legitimately allows batch-mismatched-but-broadcastable operands
+  to reach codegen; the graph builder now inserts explicit `BROADCAST_TO` ops
+  on whichever operand has smaller batch dims *before* emitting
+  `BATCH_MATMUL`, so every backend (including this one) always receives
+  matching batch dims. Every branch `33` adds to
+  `BatchedMatMulOperationParser` is gated on a batch-dim mismatch, so once the
+  graph builder guarantees matched batch dims, `33`'s code becomes dead and
+  the parser takes the original (pre-`33`) path unchanged — verified both by
+  re-reading the diff line-by-line and empirically, by reverting `33` in this
+  checkout, rebuilding `libLiteRtWebGpuAccelerator.dll`, and re-running a
+  `services_unittests` regression test
+  (`WebNNGraphImplBackendTest.MatmulBatchDimsBroadcast`, added specifically to
+  cover `33`'s B0/B1 broadcast shapes) through the real GPU delegate — both
+  cases still passed with `33` reverted. `33` is currently left applied in
+  this checkout (harmless/inert now that `34` has landed) and has not been
+  dropped from the numbered patch list; drop it once `34` has landed upstream
+  in Chromium (it's already committed locally as `c6367c7848`, just not yet
+  upstreamed). See [33-bmm-batch-broadcast.zh.md](33-bmm-batch-broadcast.zh.md)
+  §9–§10 for the full design writeup and end-to-end verification.
 
 See [../gpu_op_bisect.zh.md](../gpu_op_bisect.zh.md) for how these were found.

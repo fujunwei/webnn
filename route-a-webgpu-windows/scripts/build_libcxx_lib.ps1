@@ -12,8 +12,8 @@
 # Output: $DEST\libc++.lib (~3 MB)
 
 param(
-    [string]$ChromiumSrc = "C:\Users\junwei\workspace\chromium\src",
-    [string]$Dest        = "C:\Users\junwei\workspace\webnn\_cr_libcxx_link_win"
+    [string]$ChromiumSrc = "C:\Users\awx_localadmin\workspace\chromium\src",
+    [string]$Dest        = "C:\Users\awx_localadmin\workspace\webnn\_cr_libcxx_link_win"
 )
 
 $ErrorActionPreference = "Stop"
