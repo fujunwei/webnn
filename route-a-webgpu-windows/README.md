@@ -189,6 +189,11 @@ $text = [System.Text.Encoding]::ASCII.GetString([System.IO.File]::ReadAllBytes($
 
 > ⚠️ **必须加 `--no-sandbox`**。`PreSandboxWebNNInitialization()` 只在 GPU 进程 sandbox lockdown **之前** 预加载 accelerator DLL；之后建 device / 开 shader cache / 分配 GPU 资源仍需要 sandbox 外权限。不加时的典型症状：GPU 进程崩溃 / `chrome://gpu` 里 WebNN 显示 CPU / stderr 看不到 `... registered.`。
 
+> ⚠️ **开了 `WebNNLiteRTGpuInRenderer` 时必须同时加 `--enable-unsafe-webgpu`**。这条 feature 会让 `navigator.ml.createContext({deviceType:'gpu'})` 走渲染进程内的 `ContextImplLiteRt::CreateForRenderer()`，走之前必须先在渲染进程里成功拿到一个 `wgpu::Device`（`third_party/blink/renderer/modules/ml/ml.cc` 的 `RequestWebGpuAdapter`/`OnWebGpuDeviceRequested`）——不加 `--enable-unsafe-webgpu` 时这个 WebGPU adapter/device 请求会失败，`createContext(gpu)` 直接抛 `Failed to obtain WebGPU context for LiteRT in renderer.`，加速器 DLL 根本不会被加载。完整可用的启动参数组合：
+> ```
+> --no-sandbox --enable-features=WebMachineLearningNeuralNetwork,WebNNLiteRTGpuInRenderer --enable-unsafe-webgpu
+> ```
+
 > **关于 RDP 远程桌面**：早期在部分机器 / 驱动组合上观察到 RDP 会话（`Microsoft Remote Display Adapter` 软件间接显示适配器接管，真实 GPU 不参与渲染）导致 `D3D12CreateDevice failed with DXGI_ERROR_DRIVER_INTERNAL_ERROR (0x887A0020)`。但本次在 Windows Server 2025 + 较新 Intel 驱动下，RDP 会话（`rdp-tcp#N`）内也完整跑通了 GPU 推理（`gpu-process` 正常常驻，`readTensor` 返回正确值）。是否受 RDP 影响似乎和具体驱动/GPU 型号相关——遇到下列症状时，优先怀疑 RDP：
 > - stderr 出现 `D3D12CreateDevice failed with DXGI_ERROR_DRIVER_INTERNAL_ERROR (0x887A0020)`
 > - stderr 出现 `eglCreateContext: Requested GLES version (3.1) is greater than max supported (3.0)`
@@ -204,7 +209,8 @@ $text = [System.Text.Encoding]::ASCII.GetString([System.IO.File]::ReadAllBytes($
 & "$BUNDLE\scripts\deploy_to_chrome.ps1" -ChromeOutDir "$CR\out\upstream_bots_debug" -Mode dbg -ChromiumSrc $CR
 
 & "$CR\out\Release\chrome.exe" `
-    --no-sandbox --enable-features=WebMachineLearningNeuralNetwork `
+    --no-sandbox --enable-features=WebMachineLearningNeuralNetwork,WebNNLiteRTGpuInRenderer `
+    --enable-unsafe-webgpu `
     "file:///$WEBNN/route-a-webgpu/webnn_gpu_dispatch_test.html"
 ```
 
@@ -229,7 +235,8 @@ tar -tvf "$Out\chrome.7z" | Select-String "libLiteRt|webgpu_dawn"
 # 4) 传 $Out\mini_installer.exe 到目标机，双击安装（默认装到 %LOCALAPPDATA%\Chromium）
 # 5) 目标机上运行
 & "$env:LOCALAPPDATA\Chromium\Application\chrome.exe" `
-    --no-sandbox --enable-features=WebMachineLearningNeuralNetwork `
+    --no-sandbox --enable-features=WebMachineLearningNeuralNetwork,WebNNLiteRTGpuInRenderer `
+    --enable-unsafe-webgpu `
     "file:///<路径>/webnn_gpu_dispatch_test.html"
 ```
 
