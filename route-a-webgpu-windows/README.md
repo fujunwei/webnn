@@ -32,14 +32,22 @@ Windows 自带的 `python.exe` 是仅会弹出 Microsoft Store 页面的"应用�
 
 ## 1. 一次性 Setup
 
-换机必改路径。示例（本机）：
+**脚本不再硬编码任何机器路径**——全部按「参数 > 环境变量 > 默认值」解析（默认值从 `%USERPROFILE%` 和 bundle 自身位置推导，规则见 `scripts/common.ps1` 头注释）。同一份 bundle 拷到任何机器/账号都能直接用；只有目录布局不标准时才需要设置环境变量（可写进 `$PROFILE` 永久生效）：
 
 ```powershell
-$CR      = "C:\Users\awx_localadmin\workspace\chromium\src"
-$WEBNN   = "C:\Users\awx_localadmin\workspace\webnn"                      # 本 bundle 的父目录
+# 可选覆盖（默认值见括号）：
+#   $env:CHROMIUM_SRC        Chromium 检出（默认 %USERPROFILE%\workspace\chromium\src）
+#   $env:WEB_NN              webnn 工作目录（默认 bundle 所在位置向上两级）
+#   $env:ML_DRIFT_DIR        ml-drift 检出（默认 %CHROMIUM_SRC%\third_party\ml-drift）
+#   $env:DEPOT_TOOLS         depot_tools（默认 %USERPROFILE%\workspace\depot_tools）
+#   $env:DAWN_PREBUILT_DIR / DAWN_SRC_DIR / CR_LIBCXX_DEST（默认 webnn 下对应目录）
+
+# 下面的变量只供手工命令（打 patch 等）使用，按实际 checkout 位置填写：
+$BUNDLE  = "<webnn>\route-a-webgpu-windows"          # 本 bundle 所在目录
+$CR      = "$env:USERPROFILE\workspace\chromium\src" # 与脚本默认值一致
+$WEBNN   = Split-Path $BUNDLE -Parent
 $LITERT  = "$CR\third_party\litert\src"
 $MLDRIFT = "$CR\third_party\ml-drift"
-$BUNDLE  = "$WEBNN\route-a-webgpu-windows"
 ```
 
 ### 1.1 打包 Chromium libc++ 为静态库
@@ -53,18 +61,17 @@ Chromium `.obj` 是 LLVM bitcode，只能用 `lld-link.exe /lib` 打包。
 
 ### 1.2 编译 Dawn（webgpu_dawn.dll）
 
-必须匹配本机 Chromium 版本号。
+Dawn 必须与 Chromium 检出里的 `third_party/dawn` **严格同 commit**——不是"大版本相近就行"：加速器把 prebuilt 里 `dawn_version.h` 的 20 字节 SHA1 编进自己，运行时 `dawnProcSetProcs()` 会拿它和 Chromium 传进来的 proc table 的 version 字段逐字节比对，不一致直接 abort GPU 进程（详见 §1.4b 末尾）。版本号现在自动从 `$CR\chrome\VERSION` 读取，无需手填：
 
 ```powershell
-& "$BUNDLE\scripts\build_dawn.ps1" `
-    -SrcDir           "$WEBNN\_webgpu_dawn_src" `
-    -Dest             "$WEBNN\_dawn_prebuilt_win" `
-    -ChromiumVersion  "155.0.8054.0"
+& "$BUNDLE\scripts\build_dawn.ps1"     # -ChromiumVersion 可省略（自动读 chrome\VERSION）
 # 期望：_dawn_prebuilt_win\{include,lib,src}\，其中 lib\webgpu_dawn.dll ~10 MB，
 # src\dawn_proc.cpp 是脚本自动从 $BUNDLE\vendor\dawn_proc.cpp 拷过来的（见 §1.4b）。
 # 耗时 30-60 分钟（几乎都花在 lib\webgpu_dawn.dll 上；-define=ml_drift_use_dawn_proc=true
 # 下这个 DLL 实际不会被加速器链接，见 §1.4b 后的说明，但目前仍需要跑这一步来拿 include\ 头文件）。
 ```
+
+> **升级 Chromium 后要不要重跑这一步？先别急着跑**——`scripts\check_dawn_version.ps1` 会比对 prebuilt 与 Chromium 的 Dawn hash，一致就跳过这 30-60 分钟（§1.4b 末尾有完整升级清单）。
 
 > **Dawn 分支滞后提示**：Dawn 只有在对应 Chromium milestone 切分支后才会出现 `chromium/<BUILD>` 分支，追主线 Chromium 时常常比 Dawn 新 1-2 个 build。脚本会自动查询 `dawn.googlesource.com` 上已发布的分支列表，找不到精确匹配时自动回退到「不超过所需版本的最新分支」，并打印提示，不需要手工改版本号。
 
@@ -148,9 +155,20 @@ patch 00 里的绝对路径是本机的，换机必改：
 
 > **`scripts/build_dawn.ps1` 在 §1.4b 之后还需要吗？需要，不能删**——`prebuilt_dawn` repo rule（§1.4b 改过的 `workspace.bzl`）不管选没选 `ml_drift_use_dawn_proc`，都无条件要求 `$DAWN_PREBUILT_DIR` 下有 `include/`、`lib/`、`src/` 三个目录都存在，脚本仍是唯一产出 `include/`（Dawn 头文件）和 `lib/webgpu_dawn.dll` 的地方。已知的低效之处：`ml_drift_use_dawn_proc=true` 下加速器根本不链接 `lib/webgpu_dawn.dll`（只用 `include/` 里的头文件 + `src/dawn_proc.cpp`），所以脚本里 30-60 分钟的 CMake 编译有一部分是在编一个现在用不上的 DLL。评估过把这一步换成直接拷贝 Chromium 自己 `out\<dir>\gen\third_party\dawn\include\` 的产物，但 Chromium 自己的 GN 构建只生成一个精简子集（缺 `dawn/dawn_proc.h`、`webgpu/webgpu.h`、`dawn/native/*.h`、`dawn/wire/WireClient.h` 等完整 Dawn "SDK" 里的大量头文件），逐一核对替换的风险大于收益，故保留现状；只把 `dawn_proc.cpp` 这一个必须手工 patch 的文件迁移成了脚本自动从 `vendor/` 拷贝（见上）。
 
+> **为什么升级 Chromium 后 Dawn 仍需严格同 commit（proc 直通下也成立）**：`vendor/dawn_proc.cpp` 的 `dawnProcSetProcs()` 里有硬校验——把 Chromium 传进来的 `DawnProcTable.version`（20 字节 SHA1，Chromium 构建时从自己的 `gen/third_party/dawn/include/dawn/dawn_version.h` 填入）与加速器编译时烘焙的 `dawn::kDawnVersion`（来自 `_dawn_prebuilt_win\include\dawn\dawn_version.h`，即 build_dawn.ps1 实际 fetch 到的 Dawn commit）逐字节比对，`DAWN_CHECK` 失败 → `abort()`，GPU 进程崩溃。所以"加速器不再链接 webgpu_dawn.dll"只意味着 **lib\ 里的 DLL 无关紧要**，include\ 里的这个 hash 仍是运行时硬约束（2026-09-17 验证通过，正是因为 build_dawn.ps1 fetch 的 `chromium/8054` tip 恰好等于 Chromium DEPS 钉住的 Dawn commit，两机实测 hash 相等）。
+>
+> **升级 Chromium 后的最小步骤**：
+> 1. `gclient sync` 后**先重编 chrome**（`autoninja -C out\<dir> chrome`）——旧 chrome 二进制里的 proc table 携带旧 hash，不重编会直接触发上面的 abort（先跑加速器再重编 chrome 也会崩）。
+> 2. 跑 `& "$BUNDLE\scripts\check_dawn_version.ps1"`（可用 `-ChromeOutDir` 指定别的 out 目录）：
+>    - 绿灯（prebuilt hash == Chromium 构建的 hash）→ **不必重跑 build_dawn.ps1**，直接进 §2 重编加速器；
+>    - 红灯 → 重跑 `build_dawn.ps1`（版本号自动读 `chrome\VERSION`），再进 §2。
+> 3. 按 §2 重编 `libLiteRtWebGpuAccelerator.dll`，按 §3 重新部署。
+
 ---
 
 ## 2. 编译加速器 DLL
+
+> **升级 Chromium 后**：先按 §1.4b 末尾的清单重编 chrome + 跑 `check_dawn_version.ps1`，再执行下面的编译。
 
 **首次编译**（只为了生成工具链配置），预期会因 hermetic include 检查失败：
 
@@ -267,8 +285,10 @@ route-a-webgpu-windows/
 │   └── dawn_proc.cpp               # 1.4b: 手工 patch 过的 Dawn dawn_proc.cpp（去掉 3 个 Dawn 内部头依赖），
 │                                    #       build_dawn.ps1 每次运行都会拷进 _dawn_prebuilt_win/src/
 └── scripts/
+    ├── common.ps1                  # 路径统一解析：参数 > 环境变量 > 默认值（%USERPROFILE% + bundle 自身位置推导）
+    ├── check_dawn_version.ps1      # 1.4b: 比对 prebuilt 与 Chromium 的 Dawn 20 字节 SHA1，判断是否要重跑 build_dawn.ps1
     ├── build_libcxx_lib.ps1        # 1.1: 打包 libc++.lib
-    ├── build_dawn.ps1              # 1.2: 编 webgpu_dawn.dll + 拷贝 vendor/dawn_proc.cpp（含 python.exe 别名探测 + Dawn 分支自动回退）
+    ├── build_dawn.ps1              # 1.2: 编 webgpu_dawn.dll + 拷贝 vendor/dawn_proc.cpp（含 python.exe 别名探测 + Dawn 分支自动回退 + 版本号自动读 chrome\VERSION）
     ├── patch_bazel_toolchain.py    # 2:   打 Bazel 自动生成的 toolchain BUILD
     ├── build_accelerator_dll.ps1   # 2:   bazel build ...（含代理自动注入 + bash.exe 自动探测）
     ├── deploy_to_chrome.ps1        # 3.1: 拷 DLL 到 chrome.exe 目录（dev 迭代用）
@@ -346,6 +366,12 @@ route-a-webgpu-windows/
     升级后先按 §1.3 只打"确实还需要"的 patch，`git apply --check` 失败再对照本条判断是否已被上游吸收。
 15. **`lld-link: error: undefined symbol: __mulsc3`（链接期，不是 hermetic-include 报错）** — 出现在链接 `libLiteRtWebGpuAccelerator.dll` 的最后一步，被引用方是 tflite 内置的 `mul` kernel 对 `std::complex<float>` 做乘法（`EvalMul` / `BroadcastMul6DSlow` 等）。`__mulsc3`（以及同族的 `__muldc3`/`__divsc3`/`__divdc3`，复数乘除法的软件实现）是 clang/compiler-rt 的 builtin helper，既不在 Chromium 的 `libc++.lib` 里，也不在 `msvcprt.lib` 里，MSVC 的 STL/CRT 从不需要它们（MSVC 用不同的复数乘法展开方式）。根治：把 Chromium 自带的 `third_party\llvm-build\Release+Asserts\lib\clang\24\lib\windows\clang_rt.builtins-x86_64.lib` 作为 `--linkopt`/`--host_linkopt` 加进 `.bazelrc.user`（放在 `libc++.lib`/`msvcprt.lib` 之后即可，lld-link 对 `.lib` 顺序不敏感）。若升级 clang 后路径里的 `24`（clang 大版本号）变了，按新版本号调整该路径。
 16. **`lld-link: error: duplicate symbol: wgpuAdapterAddRef`（及一堆同类 `wgpu*` 符号）** — 打开 §1.4b 的 Dawn Proc 直通后才会出现。表面看像是 `select()` 语义有问题（`ml_drift/webgpu/BUILD` 的 `:environment` 和 `ml_drift_delegate/delegate/BUILD` 的 `delegate_webgpu` 在同一次 build 里对同一个 `config_setting` 解析出了不同分支），但真正原因是 **`WORKSPACE` 里 `local_repository(name = "ml_drift", path = "...")` 这个路径没跟着换机器/换账号一起改**——Bazel 实际读的是 `path` 指向的那份（旧的、没打 §1.4b 补丁的）`ml_drift/webgpu/BUILD`，而你以为自己在编辑的那份文件其实在另一个物理目录，编辑完全没生效。排查方法：`bazel cquery <target> --output=build --check_visibility=false` 看 `generator_location` 和 resolved deps 里的 execroot 路径，或者直接去 `<output_base>/external/ml_drift/...` 读 Bazel 实际用的那份文件，跟本地编辑的版本比对。根治：`WORKSPACE` 里所有 `local_repository`/硬编码绝对路径都要按 §1.4 的方式换成本机路径，不能假设只有 `.bazelrc.user` 需要改。
+17. **运行时 GPU 进程 abort，stderr 出现 `dawn_proc: CHECK failed: version_matches (external/dawn/src/dawn_proc.cpp:71)`** — 就是 §1.4b 里 `dawnProcSetProcs()` 的 20 字节 Dawn SHA1 逐字节比对失败：加速器编译时烘焙的 Dawn commit（`_dawn_prebuilt_win\include\dawn\dawn_version.h`）和 Chromium 当前这份 `chrome.exe` 实际编出来的 Dawn commit（`out\Release\gen\third_party\dawn\include\dawn\dawn_version.h`）不一致，多半是升级 Chromium 检出后没跟着重新走 §1.4b 的升级清单。排查/修复步骤：
+    1. **先重编 chrome**（`autoninja -C out\<dir> chrome`）——旧 `chrome.exe` 里的 proc table 携带旧 hash，不重编光重编 Dawn/加速器也没用。
+    2. 跑 `& "$BUNDLE\scripts\check_dawn_version.ps1"`（可用 `-ChromeOutDir` 指定别的 out 目录）比对两边 hash：
+       - 绿灯（一致）→ 不用重跑 `build_dawn.ps1`，直接查是不是加速器本身没跟着重编；
+       - 红灯（不一致，即本条场景）→ 重跑 `& "$BUNDLE\scripts\build_dawn.ps1"`（版本号自动读 `chrome\VERSION`，会 fetch 匹配的新 Dawn commit）。
+    3. 按 §2 重编 `libLiteRtWebGpuAccelerator.dll`，按 §3 重新部署。
 
 ---
 

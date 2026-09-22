@@ -12,9 +12,14 @@
 # Output: $DEST\libc++.lib (~3 MB)
 
 param(
-    [string]$ChromiumSrc = "C:\Users\awx_localadmin\workspace\chromium\src",
-    [string]$Dest        = "C:\Users\awx_localadmin\workspace\webnn\_cr_libcxx_link_win"
+    [string]$ChromiumSrc,   # default: %USERPROFILE%\workspace\chromium\src (or $env:CHROMIUM_SRC)
+    [string]$Dest           # default: <webnn>\_cr_libcxx_link_win       (or $env:CR_LIBCXX_DEST)
 )
+
+. "$PSScriptRoot\common.ps1"
+
+$ChromiumSrc = Resolve-BundlePath $ChromiumSrc "CHROMIUM_SRC" $DefaultChromiumSrc
+$Dest        = Resolve-BundlePath $Dest "CR_LIBCXX_DEST" $DefaultCrLibcxxDest
 
 $ErrorActionPreference = "Stop"
 

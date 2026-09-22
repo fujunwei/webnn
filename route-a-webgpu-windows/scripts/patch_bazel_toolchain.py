@@ -16,10 +16,10 @@ import shutil
 import subprocess
 import sys
 
-# ---- EDIT: paths for your machine ----
+# ---- paths: env override, else current-user default (see common.ps1) ----
 CHROMIUM_SRC = os.environ.get(
     "CHROMIUM_SRC",
-    r"C:\Users\awx_localadmin\workspace\chromium\src",
+    os.path.join(os.path.expanduser("~"), r"workspace\chromium\src"),
 )
 # Where to run `bazel info output_base`. Must be a Bazel workspace.
 BAZEL_WORKSPACE = os.environ.get(

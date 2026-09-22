@@ -1,0 +1,906 @@
+From d7f30f0b78c43303ecfef139ccc56d143260fdc3 Mon Sep 17 00:00:00 2001
+From: junweifu <junwei.fu@intel.com>
+Date: Wed, 2 Sep 2026 19:04:16 +0800
+Subject: [PATCH] Fuse sdpa in LiteRT backend with
+ odml.scaled_dot_product_attention
+
+---
+ services/webnn/tflite/graph_builder_tflite.cc | 662 +++++++++++++++++-
+ services/webnn/tflite/graph_builder_tflite.h  |  96 +++
+ 2 files changed, 753 insertions(+), 5 deletions(-)
+
+diff --git a/services/webnn/tflite/graph_builder_tflite.cc b/services/webnn/tflite/graph_builder_tflite.cc
+index 26f2ecf06b..059ec8a01d 100644
+--- a/services/webnn/tflite/graph_builder_tflite.cc
++++ b/services/webnn/tflite/graph_builder_tflite.cc
+@@ -63,6 +63,12 @@ namespace {
+ // quantized graphs.
+ BASE_FEATURE(kApplyQDQFusion, base::FEATURE_ENABLED_BY_DEFAULT);
+ 
++// Controls whether the decomposed scaled-dot-product-attention pattern is
++// fused into a `STABLEHLO_COMPOSITE` (`odml.scaled_dot_product_attention`)
++// operator. Safety valve in case fusion regresses a delegate; disabling it
++// falls back to the original decomposed op sequence on every backend.
++BASE_FEATURE(kApplySdpaFusion, base::FEATURE_ENABLED_BY_DEFAULT);
++
+ // The version number of the Schema. Ideally all changes will be backward
+ // compatible. If that ever changes, we must ensure that version is the first
+ // entry in the new tflite root so that we can see that version is not 1.
+@@ -740,6 +746,19 @@ auto GraphBuilderTflite::CreateAndBuild(
+           *operation->get_dequantize_linear()));
+     }
+   }
++  // Match the decomposed scaled-dot-product-attention pattern up front, so
++  // that each matched chain's composite can be emitted at the chain's final
++  // Matmul (see `RecordScaledDotProductAttentionFusion`) while the rest of
++  // the chain is skipped from its very first operation.
++  if (base::FeatureList::IsEnabled(kApplySdpaFusion)) {
++    for (size_t i = 0; i < graph_info.operations.size(); ++i) {
++      const mojom::OperationPtr& operation = graph_info.operations[i];
++      if (operation->is_transpose()) {
++        builder.RecordScaledDotProductAttentionFusion(
++            *operation->get_transpose(), i);
++      }
++    }
++  }
+   for (size_t i = 0; i < graph_info.operations.size(); ++i) {
+     const mojom::OperationPtr& operation = graph_info.operations[i];
+     if (!graph_requires_fp32_precision &&
+@@ -1444,6 +1463,9 @@ base::expected<void, std::string> GraphBuilderTflite::SerializeOperation(
+       break;
+     }
+     case mojom::Operation::Tag::kDequantizeLinear: {
++      if (fused_ops_to_skip_.contains(operation_index)) {
++        return base::ok();
++      }
+       auto operation = *op.get_dequantize_linear();
+       // Don't serialize the dequantize right now until the dequantized output
+       // is needed for a subsequent operation. During `SerializeInputTensorInfo`
+@@ -1457,6 +1479,9 @@ base::expected<void, std::string> GraphBuilderTflite::SerializeOperation(
+       break;
+     }
+     case mojom::Operation::Tag::kElementWiseBinary: {
++      if (fused_ops_to_skip_.contains(operation_index)) {
++        return base::ok();
++      }
+       ASSIGN_OR_RETURN(operator_offset, SerializeElementWiseBinary(
+                                             *op.get_element_wise_binary()));
+       break;
+@@ -1543,6 +1568,19 @@ base::expected<void, std::string> GraphBuilderTflite::SerializeOperation(
+       break;
+     }
+     case mojom::Operation::Tag::kMatmul: {
++      if (fused_ops_to_skip_.contains(operation_index)) {
++        return base::ok();
++      }
++      // This is the final Matmul of a scaled-dot-product-attention chain
++      // recorded by `RecordScaledDotProductAttentionFusion`; emit the whole
++      // chain as one composite operator here instead.
++      if (auto sdpa_it = sdpa_fusions_.find(operation_index);
++          sdpa_it != sdpa_fusions_.end()) {
++        ASSIGN_OR_RETURN(
++            operator_offset,
++            SerializeScaledDotProductAttentionComposite(sdpa_it->second));
++        break;
++      }
+       ASSIGN_OR_RETURN(operator_offset, SerializeMatmul(*op.get_matmul()));
+       break;
+     }
+@@ -1609,6 +1647,9 @@ base::expected<void, std::string> GraphBuilderTflite::SerializeOperation(
+       break;
+     }
+     case mojom::Operation::Tag::kSoftmax: {
++      if (fused_ops_to_skip_.contains(operation_index)) {
++        return base::ok();
++      }
+       ASSIGN_OR_RETURN(operator_offset, SerializeSoftmax(*op.get_softmax()));
+       break;
+     }
+@@ -1633,6 +1674,9 @@ base::expected<void, std::string> GraphBuilderTflite::SerializeOperation(
+       break;
+     }
+     case mojom::Operation::Tag::kTranspose: {
++      if (fused_ops_to_skip_.contains(operation_index)) {
++        return base::ok();
++      }
+       ASSIGN_OR_RETURN(operator_offset,
+                        SerializeTranspose(*op.get_transpose()));
+       break;
+@@ -1857,6 +1901,482 @@ GraphBuilderTflite::CanFuseActivationAndGetOutput(OperandId output_operand_id) {
+                                    output_tensor_info.index, *activation_type);
+ }
+ 
++std::optional<float> GraphBuilderTflite::GetEffectiveScalarScale(
++    OperandId operand_id) {
++  if (std::optional<float> direct = GetFloatScalarConstant(operand_id)) {
++    return direct;
++  }
++
++  // Fall back to a scalar constant wrapped by a single `DequantizeLinear`
++  // (e.g. an fp16-packed scale), folding the dequantize formula in C++.
++  auto producer_it = operand_to_producing_operation_->find(operand_id);
++  if (producer_it == operand_to_producing_operation_->end()) {
++    return std::nullopt;
++  }
++  const mojom::Operation& producer =
++      *graph_info_->operations[producer_it->second];
++  if (!producer.is_dequantize_linear()) {
++    return std::nullopt;
++  }
++  const mojom::DequantizeLinear& dequantize = *producer.get_dequantize_linear();
++
++  auto read_scalar_as_float = [&](OperandId id) -> std::optional<float> {
++    const mojom::Operand& operand = GetOperand(id);
++    if (operand.kind != mojom::Operand::Kind::kConstant ||
++        operand.descriptor.NumberOfElements() != 1) {
++      return std::nullopt;
++    }
++    switch (operand.descriptor.data_type()) {
++      case OperandDataType::kFloat32:
++        return GetConstantValue<float>(id)[0];
++      case OperandDataType::kFloat16:
++        return fp16_ieee_to_fp32_value(GetConstantValue<Float16>(id)[0].data);
++      case OperandDataType::kInt8:
++        return static_cast<float>(GetConstantValue<int8_t>(id)[0]);
++      case OperandDataType::kUint8:
++        return static_cast<float>(GetConstantValue<uint8_t>(id)[0]);
++      case OperandDataType::kInt32:
++        return static_cast<float>(GetConstantValue<int32_t>(id)[0]);
++      default:
++        return std::nullopt;
++    }
++  };
++
++  std::optional<float> raw_value =
++      read_scalar_as_float(dequantize.input_operand_id);
++  std::optional<float> dequant_scale =
++      read_scalar_as_float(dequantize.scale_operand_id);
++  if (!raw_value || !dequant_scale) {
++    return std::nullopt;
++  }
++  float zero_point =
++      read_scalar_as_float(dequantize.zero_point_operand_id).value_or(0.0f);
++  return (*raw_value - zero_point) * (*dequant_scale);
++}
++
++base::expected<int32_t, std::string>
++GraphBuilderTflite::BuildScaledDotProductAttentionDecompositionSubgraph(
++    const mojom::Transpose& transpose,
++    const mojom::Matmul& matmul1,
++    const mojom::DequantizeLinear* scale_dequantize,
++    const mojom::ElementWiseBinary& mul,
++    const mojom::Softmax& softmax,
++    const mojom::Matmul& matmul2,
++    OperandId q_operand_id,
++    OperandId k_operand_id,
++    OperandId v_operand_id,
++    const TensorInfo& q_tensor_info,
++    const TensorInfo& k_tensor_info,
++    const TensorInfo& v_tensor_info,
++    const TensorInfo& output_tensor_info) {
++  // `tensors_`, `operators_`, `operand_to_tensor_info_map_`,
++  // `lazy_serialized_dequantize_operations_` and
++  // `graph_output_cast_operators_` are the only members that are
++  // subgraph-local (`buffers_` holds model-global constant data and must
++  // stay shared). Temporarily redirect them to a fresh scope, replay the
++  // exact original ops into it, then restore the main graph's state
++  // unconditionally.
++  //
++  // `graph_output_cast_operators_` in particular must be swapped out *and*
++  // restored: it is a deferred sink that `FinishAndTakeResult` appends to the
++  // end of the main graph's operator list, so leaving a replay-time entry in
++  // it would splice an operator built from subgraph-local tensor indices into
++  // the main graph, where those indices are out of range and the model no
++  // longer loads at all.
++  std::vector<TensorOffset> saved_tensors = std::exchange(tensors_, {});
++  std::vector<OperatorOffset> saved_operators = std::exchange(operators_, {});
++  auto saved_operand_to_tensor_info_map =
++      std::exchange(operand_to_tensor_info_map_, {});
++  auto saved_lazy_serialized_dequantize_operations =
++      std::exchange(lazy_serialized_dequantize_operations_, {});
++  std::vector<OperatorOffset> saved_graph_output_cast_operators =
++      std::exchange(graph_output_cast_operators_, {});
++
++  base::expected<flatbuffers::Offset<::tflite::SubGraph>, std::string> result =
++      [&]() -> base::expected<flatbuffers::Offset<::tflite::SubGraph>,
++                              std::string> {
++    // Pre-seed Q/K/V into the (now-cleared, subgraph-local)
++    // `operand_to_tensor_info_map_` with the exact types they already have
++    // in the main graph, before replaying any op that references them. This
++    // makes the subsequent `SerializeInputTensorInfo` calls inside
++    // `SerializeTranspose`/`SerializeMatmul` below hit these cached entries
++    // directly instead of deriving a fresh (and possibly mismatched) type
++    // from the raw operand dtype.
++    RETURN_IF_ERROR(SerializeOperand(q_operand_id, /*quantize_params=*/0,
++                                     q_tensor_info.data_type));
++    RETURN_IF_ERROR(SerializeOperand(k_operand_id, /*quantize_params=*/0,
++                                     k_tensor_info.data_type));
++    RETURN_IF_ERROR(SerializeOperand(v_operand_id, /*quantize_params=*/0,
++                                     v_tensor_info.data_type));
++    // Seed Matmul#2's output the same way. Inside this subgraph that operand
++    // is a plain intermediate, but `SerializeOutputTensorInfo` would classify
++    // it by its *main-graph* role: for a float16 operand that names a graph
++    // output it registers a float16 tensor, hands back a separate float32
++    // temporary for the producing operation to write, and queues a cast
++    // between them. Replaying Matmul#2 against that would leave this
++    // subgraph's declared output unwritten (nothing produces the float16
++    // tensor here) and its type out of step with the composite's float32
++    // boundary. Seeding the boundary type up front makes the nested
++    // `SerializeOutputTensorInfo` hit the cache and skip all of that.
++    RETURN_IF_ERROR(SerializeOperand(matmul2.output_operand_id,
++                                     /*quantize_params=*/0,
++                                     output_tensor_info.data_type));
++
++    // TFLite's `stablehlo_composite` kernel forces this subgraph's declared
++    // input/output tensors to structurally match the composite operator's
++    // boundary tensors in the main graph (`CopyTensorsShapeAndType` with
++    // `resize_subgraph_inputs=true`, called from this kernel's `Prepare()`
++    // before every invocation, delegated or not). Since the composite's
++    // boundary is rank-4 (NumHeads=1 axis inserted, see
++    // `TryFuseScaledDotProductAttention`), this subgraph's declared
++    // input/output tensors must also be rank-4, or that forced resize
++    // corrupts them and every internal op's `Prepare()` fails before any
++    // delegate is even applied. Insert matching reshapes at the boundary so
++    // the internal ops below keep replaying the exact original rank-3
++    // sequence unchanged.
++    auto InsertNumHeadsOneAxisSubgraphInput =
++        [&](OperandId operand_id, const TensorInfo& tensor_info)
++        -> base::expected<TensorIndex, std::string> {
++      std::vector<int32_t> new_shape = tensor_info.dimensions;
++      CHECK(!new_shape.empty());
++      new_shape.insert(new_shape.end() - 1, 1);
++      ASSIGN_OR_RETURN(const TensorIndex boundary_tensor_index,
++                       SerializeTemporaryTensorWithByteSizeCheck(
++                           new_shape, tensor_info.data_type));
++      operators_.emplace_back(SerializeReshapeOperation(
++          boundary_tensor_index,
++          operand_to_tensor_info_map_.at(operand_id).index,
++          operand_to_tensor_info_map_.at(operand_id).dimensions));
++      return boundary_tensor_index;
++    };
++    ASSIGN_OR_RETURN(const TensorIndex q_boundary_tensor_index,
++                     InsertNumHeadsOneAxisSubgraphInput(q_operand_id,
++                                                        q_tensor_info));
++    ASSIGN_OR_RETURN(const TensorIndex k_boundary_tensor_index,
++                     InsertNumHeadsOneAxisSubgraphInput(k_operand_id,
++                                                        k_tensor_info));
++    ASSIGN_OR_RETURN(const TensorIndex v_boundary_tensor_index,
++                     InsertNumHeadsOneAxisSubgraphInput(v_operand_id,
++                                                        v_tensor_info));
++
++    ASSIGN_OR_RETURN(OperatorOffset transpose_offset,
++                     SerializeTranspose(transpose));
++    operators_.emplace_back(transpose_offset);
++    ASSIGN_OR_RETURN(OperatorOffset matmul1_offset, SerializeMatmul(matmul1));
++    operators_.emplace_back(matmul1_offset);
++    if (scale_dequantize) {
++      ASSIGN_OR_RETURN(OperatorOffset dequantize_offset,
++                       SerializeDequantizeLinear(*scale_dequantize));
++      operators_.emplace_back(dequantize_offset);
++    }
++    ASSIGN_OR_RETURN(OperatorOffset mul_offset,
++                     SerializeElementWiseBinary(mul));
++    operators_.emplace_back(mul_offset);
++    ASSIGN_OR_RETURN(OperatorOffset softmax_offset, SerializeSoftmax(softmax));
++    operators_.emplace_back(softmax_offset);
++    ASSIGN_OR_RETURN(OperatorOffset matmul2_offset, SerializeMatmul(matmul2));
++    operators_.emplace_back(matmul2_offset);
++
++    // Any cast the replayed operations deferred belongs to *this* subgraph,
++    // since it was built from subgraph-local tensor indices. The pre-seeding
++    // above is expected to keep this empty; drain it regardless so such an
++    // operator can never leak out into the main graph.
++    std::ranges::move(graph_output_cast_operators_,
++                      std::back_inserter(operators_));
++    graph_output_cast_operators_.clear();
++
++    const TensorInfo& matmul2_output_tensor_info =
++        operand_to_tensor_info_map_.at(matmul2.output_operand_id);
++    std::vector<int32_t> output_boundary_shape =
++        matmul2_output_tensor_info.dimensions;
++    CHECK(!output_boundary_shape.empty());
++    output_boundary_shape.insert(output_boundary_shape.end() - 1, 1);
++    ASSIGN_OR_RETURN(const TensorIndex output_boundary_tensor_index,
++                     SerializeTemporaryTensorWithByteSizeCheck(
++                         output_boundary_shape,
++                         matmul2_output_tensor_info.data_type));
++    operators_.emplace_back(SerializeReshapeOperation(
++        matmul2_output_tensor_info.index, output_boundary_tensor_index,
++        output_boundary_shape));
++
++    const std::array<TensorIndex, 3> subgraph_inputs = {
++        q_boundary_tensor_index, k_boundary_tensor_index,
++        v_boundary_tensor_index};
++    const std::array<TensorIndex, 1> subgraph_outputs = {
++        output_boundary_tensor_index};
++    return ::tflite::CreateSubGraph(
++        builder_, builder_.CreateVector(tensors_.data(), tensors_.size()),
++        builder_.CreateVector<TensorIndex>(subgraph_inputs),
++        builder_.CreateVector<TensorIndex>(subgraph_outputs),
++        builder_.CreateVector(operators_.data(), operators_.size()));
++  }();
++
++  tensors_ = std::move(saved_tensors);
++  operators_ = std::move(saved_operators);
++  operand_to_tensor_info_map_ = std::move(saved_operand_to_tensor_info_map);
++  lazy_serialized_dequantize_operations_ =
++      std::move(saved_lazy_serialized_dequantize_operations);
++  graph_output_cast_operators_ =
++      std::move(saved_graph_output_cast_operators);
++
++  if (!result.has_value()) {
++    return base::unexpected(std::move(result.error()));
++  }
++  const int32_t subgraph_index =
++      base::checked_cast<int32_t>(1 + decomposition_subgraphs_.size());
++  decomposition_subgraphs_.push_back(*result);
++  return subgraph_index;
++}
++
++void GraphBuilderTflite::RecordScaledDotProductAttentionFusion(
++    const mojom::Transpose& transpose,
++    OperationId transpose_id) {
++  // 1. Transpose(K)'s sole dependent must be Matmul#1, consuming the
++  //    transpose's output as the `b` (K^T) operand.
++  std::optional<OperationId> matmul1_id =
++      GetSoleDependentOperationId(transpose.output_operand_id);
++  if (!matmul1_id) {
++    return;
++  }
++  const mojom::Operation& matmul1_op = *graph_info_->operations[*matmul1_id];
++  if (!matmul1_op.is_matmul()) {
++    return;
++  }
++  const mojom::Matmul& matmul1 = *matmul1_op.get_matmul();
++  if (matmul1.b_operand_id != transpose.output_operand_id) {
++    return;
++  }
++  const OperandId q_operand_id = matmul1.a_operand_id;
++  const OperandId k_operand_id = transpose.input_operand_id;
++
++  // 2. Matmul#1's sole dependent must be `Mul` (the scale multiply).
++  std::optional<OperationId> mul_id =
++      GetSoleDependentOperationId(matmul1.output_operand_id);
++  if (!mul_id) {
++    return;
++  }
++  const mojom::Operation& mul_op = *graph_info_->operations[*mul_id];
++  if (!mul_op.is_element_wise_binary()) {
++    return;
++  }
++  const mojom::ElementWiseBinary& mul = *mul_op.get_element_wise_binary();
++  if (mul.kind != mojom::ElementWiseBinary::Kind::kMul) {
++    return;
++  }
++  OperandId scale_operand_id;
++  if (mul.lhs_operand_id == matmul1.output_operand_id) {
++    scale_operand_id = mul.rhs_operand_id;
++  } else if (mul.rhs_operand_id == matmul1.output_operand_id) {
++    scale_operand_id = mul.lhs_operand_id;
++  } else {
++    return;
++  }
++
++  // The scale must be a compile-time-constant scalar, optionally produced by
++  // a `DequantizeLinear` (e.g. an fp16-packed scale) that must be replayed
++  // verbatim in the decomposition subgraph.
++  const mojom::DequantizeLinear* scale_dequantize = nullptr;
++  auto scale_producer_it = operand_to_producing_operation_->find(scale_operand_id);
++  if (scale_producer_it != operand_to_producing_operation_->end()) {
++    const mojom::Operation& scale_producer =
++        *graph_info_->operations[scale_producer_it->second];
++    if (scale_producer.is_dequantize_linear()) {
++      scale_dequantize = &*scale_producer.get_dequantize_linear();
++    }
++  }
++  std::optional<float> scale = GetEffectiveScalarScale(scale_operand_id);
++  if (!scale) {
++    return;
++  }
++
++  // 3. `Mul`'s sole dependent must be `Softmax` over the last axis.
++  std::optional<OperationId> softmax_id =
++      GetSoleDependentOperationId(mul.output_operand_id);
++  if (!softmax_id) {
++    return;
++  }
++  const mojom::Operation& softmax_op = *graph_info_->operations[*softmax_id];
++  if (!softmax_op.is_softmax()) {
++    return;
++  }
++  const mojom::Softmax& softmax = *softmax_op.get_softmax();
++  const auto& softmax_input_shape =
++      GetOperand(softmax.input_operand_id).descriptor.shape();
++  if (softmax_input_shape.empty() ||
++      softmax.axis != static_cast<uint32_t>(softmax_input_shape.size() - 1)) {
++    return;
++  }
++
++  // 4. `Softmax`'s sole dependent must be Matmul#2, consuming the softmax
++  //    output as one operand and V as the other.
++  std::optional<OperationId> matmul2_id =
++      GetSoleDependentOperationId(softmax.output_operand_id);
++  if (!matmul2_id) {
++    return;
++  }
++  const mojom::Operation& matmul2_op = *graph_info_->operations[*matmul2_id];
++  if (!matmul2_op.is_matmul()) {
++    return;
++  }
++  const mojom::Matmul& matmul2 = *matmul2_op.get_matmul();
++  OperandId v_operand_id;
++  if (matmul2.a_operand_id == softmax.output_operand_id) {
++    v_operand_id = matmul2.b_operand_id;
++  } else if (matmul2.b_operand_id == softmax.output_operand_id) {
++    v_operand_id = matmul2.a_operand_id;
++  } else {
++    return;
++  }
++
++  // Pattern matched. Record it against Matmul#2, where the composite is
++  // emitted, and skip every other operation of the chain.
++  sdpa_fusions_.insert(
++      {*matmul2_id, ScaledDotProductAttentionFusion{
++                        .transpose = &transpose,
++                        .matmul1 = &matmul1,
++                        .scale_dequantize = scale_dequantize,
++                        .mul = &mul,
++                        .softmax = &softmax,
++                        .matmul2 = &matmul2,
++                        .q_operand_id = q_operand_id,
++                        .k_operand_id = k_operand_id,
++                        .v_operand_id = v_operand_id,
++                        .scale = *scale}});
++  fused_ops_to_skip_.insert(transpose_id);
++  fused_ops_to_skip_.insert(*matmul1_id);
++  if (scale_dequantize) {
++    fused_ops_to_skip_.insert(scale_producer_it->second);
++  }
++  fused_ops_to_skip_.insert(*mul_id);
++  fused_ops_to_skip_.insert(*softmax_id);
++}
++
++base::expected<GraphBuilderTflite::OperatorOffset, std::string>
++GraphBuilderTflite::SerializeScaledDotProductAttentionComposite(
++    const ScaledDotProductAttentionFusion& fusion) {
++  const mojom::Transpose& transpose = *fusion.transpose;
++  const mojom::Matmul& matmul1 = *fusion.matmul1;
++  const mojom::ElementWiseBinary& mul = *fusion.mul;
++  const mojom::Softmax& softmax = *fusion.softmax;
++  const mojom::Matmul& matmul2 = *fusion.matmul2;
++  const OperandId q_operand_id = fusion.q_operand_id;
++  const OperandId k_operand_id = fusion.k_operand_id;
++  const OperandId v_operand_id = fusion.v_operand_id;
++
++  // Serialize Q/K/V's tensor info in the main graph first.
++  // `operation_supports_float16=false` (the default, same as `SerializeMatmul`
++  // uses for its own operands) so that any operand that happens to be
++  // natively float16 gets upcast to float32 right here, exactly as it would
++  // have been inside Matmul#1/Matmul#2 in the original decomposed graph.
++  // Skipping this cast would let one of Q/K/V stay float16 while the others
++  // are float32 (whichever operand happens to already be produced as
++  // float16 upstream), a mixed-dtype boundary the ml-drift GPU SDPA kernel
++  // builder does not itself normalize, producing nonsensical output. The
++  // decomposition subgraph built below is then seeded with these exact same
++  // (post-cast) types, since the TFLite runtime requires the composite
++  // operator's declared input types to structurally match its decomposition
++  // subgraph's declared input types.
++  ASSIGN_OR_RETURN(const TensorInfo q_tensor_info,
++                   SerializeInputTensorInfo(q_operand_id));
++  ASSIGN_OR_RETURN(const TensorInfo k_tensor_info,
++                   SerializeInputTensorInfo(k_operand_id));
++  ASSIGN_OR_RETURN(const TensorInfo v_tensor_info,
++                   SerializeInputTensorInfo(v_operand_id));
++
++  // Serialize the composite's output boundary in the main graph before
++  // building the decomposition subgraph, so the subgraph can be seeded with
++  // the exact same type (see the `matmul2` pre-seed there). Note that when
++  // `matmul2`'s output operand is a float16 *graph* output this returns a
++  // float32 temporary and queues the float32->float16 cast into
++  // `graph_output_cast_operators_`, which is why the subgraph must not
++  // re-derive that type on its own.
++  ASSIGN_OR_RETURN(const TensorInfo output_tensor_info,
++                   SerializeOutputTensorInfo(matmul2.output_operand_id));
++
++  // Build the decomposition subgraph (CPU/XNNPACK fallback, running the
++  // exact original ops) before emitting the composite operator.
++  ASSIGN_OR_RETURN(
++      const int32_t decomposition_subgraph_index,
++      BuildScaledDotProductAttentionDecompositionSubgraph(
++          transpose, matmul1, fusion.scale_dequantize, mul, softmax, matmul2,
++          q_operand_id, k_operand_id, v_operand_id, q_tensor_info,
++          k_tensor_info, v_tensor_info, output_tensor_info));
++
++  // ml-drift's GPU SDPA kernel (`operation_selector.cc`'s
++  // `MakeScaledDotProductAttention`) interprets a Q/K/V tensor's BHWC-mapped
++  // shape as [Batch, SeqLen, NumHeads, HeadDim] -- confirmed via
++  // `convert_sdpa_test.cc`'s `{1, 4, 8, 16}` Q/K/V shapes together with the
++  // `WithMask` test's mask shape `{1, 1, 8, 4}` ("C=4 matches K.H=4"), which
++  // pins dim 1 to SeqLen, dim 2 to NumHeads and dim 3 to HeadDim. WebNN's
++  // decomposed self-attention pattern has no explicit heads dimension: Q/K/V
++  // here are rank-3 `[Batch, SeqLen, Channels]`. Left as-is, TFLite's
++  // `ExtractTensorShape` would map that to BHWC(Batch, H=1, W=SeqLen,
++  // C=Channels), which the kernel reads as SeqLen=1, NumHeads=SeqLen --
++  // attending every sequence position as an independent single-token head.
++  // Insert an explicit NumHeads=1 axis before the channel axis so the
++  // composite's declared inputs/output are rank-4 in the layout the kernel
++  // expects; the decomposition subgraph below is unaffected and keeps
++  // operating on the original rank-3 tensors.
++  auto InsertNumHeadsOneAxis =
++      [&](const TensorInfo& tensor_info) -> base::expected<TensorIndex, std::string> {
++    std::vector<int32_t> new_shape = tensor_info.dimensions;
++    CHECK(!new_shape.empty());
++    new_shape.insert(new_shape.end() - 1, 1);
++    ASSIGN_OR_RETURN(const TensorIndex reshaped_tensor_index,
++                     SerializeTemporaryTensorWithByteSizeCheck(
++                         new_shape, tensor_info.data_type));
++    operators_.emplace_back(SerializeReshapeOperation(
++        tensor_info.index, reshaped_tensor_index, new_shape));
++    return reshaped_tensor_index;
++  };
++  ASSIGN_OR_RETURN(const TensorIndex q_composite_input_index,
++                   InsertNumHeadsOneAxis(q_tensor_info));
++  ASSIGN_OR_RETURN(const TensorIndex k_composite_input_index,
++                   InsertNumHeadsOneAxis(k_tensor_info));
++  ASSIGN_OR_RETURN(const TensorIndex v_composite_input_index,
++                   InsertNumHeadsOneAxis(v_tensor_info));
++
++  std::vector<int32_t> composite_output_shape = output_tensor_info.dimensions;
++  CHECK(!composite_output_shape.empty());
++  composite_output_shape.insert(composite_output_shape.end() - 1, 1);
++  ASSIGN_OR_RETURN(const TensorIndex composite_output_tensor_index,
++                   SerializeTemporaryTensorWithByteSizeCheck(
++                       composite_output_shape, output_tensor_info.data_type));
++
++  // Attributes flexbuffer: `{"scale": float}`, matching what ml-drift's
++  // `convert_sdpa.cc` parses via `flexbuffers::GetRoot(...).AsMap()["scale"]`.
++  flexbuffers::Builder fbb;
++  fbb.Map([&] { fbb.Float("scale", fusion.scale); });
++  fbb.Finish();
++  const std::vector<uint8_t>& composite_attributes = fbb.GetBuffer();
++  const flatbuffers::Offset<::tflite::StableHLOCompositeOptions>
++      composite_options = ::tflite::CreateStableHLOCompositeOptionsDirect(
++          builder_, "odml.scaled_dot_product_attention",
++          decomposition_subgraph_index, &composite_attributes);
++
++  const std::array<TensorIndex, 3> op_inputs = {
++      q_composite_input_index, k_composite_input_index,
++      v_composite_input_index};
++  const std::array<TensorIndex, 1> op_outputs = {
++      composite_output_tensor_index};
++  OperatorOffset composite_operator = ::tflite::CreateOperator(
++      builder_,
++      GetOperatorCodeIndex(::tflite::BuiltinOperator_STABLEHLO_COMPOSITE),
++      builder_.CreateVector<TensorIndex>(op_inputs),
++      builder_.CreateVector<TensorIndex>(op_outputs),
++      ::tflite::BuiltinOptions_NONE, /*builtin_options=*/0,
++      /*custom_options=*/0, ::tflite::CustomOptionsFormat_FLEXBUFFERS,
++      /*mutating_variable_inputs=*/0, /*intermediates=*/0,
++      /*large_custom_options_offset=*/0, /*large_custom_options_size=*/0,
++      ::tflite::BuiltinOptions2_StableHLOCompositeOptions,
++      composite_options.Union());
++  operators_.emplace_back(composite_operator);
++
++  return SerializeReshapeOperation(composite_output_tensor_index,
++                                   output_tensor_info.index,
++                                   output_tensor_info.dimensions);
++}
++
+ base::expected<std::optional<GraphBuilderTflite::TensorInfo>, std::string>
+ GraphBuilderTflite::CanFuseQuantizeAndGetOutput(const mojom::Clamp& clamp,
+                                                 bool is_emulated) {
+@@ -3237,6 +3757,15 @@ auto GraphBuilderTflite::FinishAndTakeResult(
+       graph_input_ids_index, graph_output_ids_index,
+       builder_.CreateVector(operators_.data(), operators_.size()));
+ 
++  // The main subgraph is always index 0; any decomposition subgraphs
++  // referenced by `STABLEHLO_COMPOSITE` operators (e.g. from
++  // `TryFuseScaledDotProductAttention`) follow in the order they were built.
++  std::vector<flatbuffers::Offset<::tflite::SubGraph>> subgraphs;
++  subgraphs.reserve(1 + decomposition_subgraphs_.size());
++  subgraphs.push_back(subgraph);
++  subgraphs.insert(subgraphs.end(), decomposition_subgraphs_.begin(),
++                   decomposition_subgraphs_.end());
++
+   StringOffset description =
+       builder_.CreateString("TFLite model converted from WebNN Graph");
+ 
+@@ -3261,12 +3790,11 @@ auto GraphBuilderTflite::FinishAndTakeResult(
+ 
+   // The operator codes used in this model are kept in order because operators
+   // carry an index into this std::vector.
+-  // There is only one subgraph in the model. The buffers of the model must be
+-  // initialized an empty buffer.
++  // The buffers of the model must be initialized an empty buffer.
+   flatbuffers::Offset<::tflite::Model> model_buffer = ::tflite::CreateModel(
+       builder_, TFLITE_SCHEMA_VERSION,
+       builder_.CreateVector(operator_codes_.data(), operator_codes_.size()),
+-      builder_.CreateVector(&subgraph, 1), description,
++      builder_.CreateVector(subgraphs), description,
+       builder_.CreateVector(buffers_.data(), buffers_.size()),
+       /*metadata_buffer=*/0,  // deprecated, metadata buffer is in `buffers_`.
+       builder_.CreateVector(metadata), /*signature_defs=*/0,
+@@ -7535,6 +8063,119 @@ auto GraphBuilderTflite::SerializeIdentityOperation(OperandId input_operand_id,
+   return OperatorOffset{};  // null
+ }
+ 
++auto GraphBuilderTflite::SerializeInstanceNormalizationAsCustomCall(
++    const mojom::InstanceNormalization& instance_normalization)
++    -> std::optional<OperatorOffset> {
++  // Gate: the fused kernel is only registered by LiteRT when the ML Drift
++  // WebGPU accelerator is selected (see
++  // `third_party/litert/src/litert/runtime/compiled_model.cc`, which calls
++  // `resolver->AddCustom("custom_call.GroupNorm", ...)` only under
++  // `kLiteRtHwAcceleratorGpu`).
++  if (context_device_ != mojom::Device::kGpu) {
++    return std::nullopt;
++  }
++
++  const mojom::Operand& input_operand =
++      GetOperand(instance_normalization.input_operand_id);
++  const auto& input_shape = input_operand.descriptor.shape();
++  const OperandDataType input_dtype = input_operand.descriptor.data_type();
++
++  // ML Drift's group-norm kernel is strictly 4-D BHWC and float.
++  if (input_shape.size() != 4) {
++    return std::nullopt;
++  }
++  if (input_dtype != OperandDataType::kFloat32 &&
++      input_dtype != OperandDataType::kFloat16) {
++    return std::nullopt;
++  }
++  // Chromium serializes instance norm as NHWC, so channels are the last
++  // axis. Anything else would make `num_groups` refer to the wrong
++  // dimension.
++  if (context_properties_.input_operand_layout != InputOperandLayout::kNhwc) {
++    return std::nullopt;
++  }
++  const uint32_t channels = input_shape[3];
++  if (channels == 0) {
++    return std::nullopt;
++  }
++
++  // GroupNormParser reads inputs [x, gamma, beta] positionally and checks
++  // that each is 1-D of exactly `channels`. A bias without a scale would be
++  // read as the scale, so bail on that shape.
++  if (instance_normalization.bias_operand_id &&
++      !instance_normalization.scale_operand_id) {
++    return std::nullopt;
++  }
++  auto is_valid_param = [&](OperandId operand_id) -> bool {
++    const mojom::Operand& op = GetOperand(operand_id);
++    if (op.kind != mojom::Operand::Kind::kConstant) {
++      return false;
++    }
++    if (op.descriptor.data_type() != OperandDataType::kFloat32 &&
++        op.descriptor.data_type() != OperandDataType::kFloat16) {
++      return false;
++    }
++    const auto& s = op.descriptor.shape();
++    return s.size() == 1 && s[0] == channels;
++  };
++  if (instance_normalization.scale_operand_id &&
++      !is_valid_param(*instance_normalization.scale_operand_id)) {
++    return std::nullopt;
++  }
++  if (instance_normalization.bias_operand_id &&
++      !is_valid_param(*instance_normalization.bias_operand_id)) {
++    return std::nullopt;
++  }
++
++  // All preconditions satisfied — emit the custom op.
++  ASSIGN_OR_RETURN(
++      const TensorInfo& input_tensor_info,
++      SerializeInputTensorInfo(instance_normalization.input_operand_id),
++      [](auto) { return std::nullopt; });
++  std::vector<TensorIndex> op_inputs;
++  op_inputs.reserve(3);
++  op_inputs.push_back(input_tensor_info.index);
++  if (instance_normalization.scale_operand_id) {
++    ASSIGN_OR_RETURN(
++        const TensorInfo& scale_tensor_info,
++        SerializeInputTensorInfo(*instance_normalization.scale_operand_id),
++        [](auto) { return std::nullopt; });
++    op_inputs.push_back(scale_tensor_info.index);
++  }
++  if (instance_normalization.bias_operand_id) {
++    ASSIGN_OR_RETURN(
++        const TensorInfo& bias_tensor_info,
++        SerializeInputTensorInfo(*instance_normalization.bias_operand_id),
++        [](auto) { return std::nullopt; });
++    op_inputs.push_back(bias_tensor_info.index);
++  }
++  ASSIGN_OR_RETURN(
++      const TensorInfo output_tensor_info,
++      SerializeOutputTensorInfo(instance_normalization.output_operand_id),
++      [](auto) { return std::nullopt; });
++  const std::array<TensorIndex, 1> op_outputs = {output_tensor_info.index};
++
++  // Attributes flexbuffer: `{"num_groups": int, "epsilon": float}`. Instance
++  // norm normalizes each channel independently, i.e. one channel per group,
++  // so num_groups == channels. GroupNormParser only reads these when
++  // `custom_initial_data` is present -- otherwise it silently defaults to
++  // groups=32/epsilon=1e-6 -- so both must always be written.
++  flexbuffers::Builder fbb;
++  fbb.Map([&] {
++    fbb.Int("num_groups", base::checked_cast<int32_t>(channels));
++    fbb.Float("epsilon", instance_normalization.epsilon);
++  });
++  fbb.Finish();
++  const auto custom_options = builder_.CreateVector(fbb.GetBuffer());
++
++  return ::tflite::CreateOperator(
++      builder_, GetCustomOperatorCodeIndex("custom_call.GroupNorm"),
++      builder_.CreateVector<TensorIndex>(op_inputs),
++      builder_.CreateVector<TensorIndex>(op_outputs),
++      ::tflite::BuiltinOptions_NONE, /*builtin_options=*/0, custom_options,
++      ::tflite::CustomOptionsFormat_FLEXBUFFERS);
++}
++
+ auto GraphBuilderTflite::SerializeInstanceNormalization(
+     const mojom::InstanceNormalization& instance_normalization)
+     -> base::expected<OperatorOffset, std::string> {
+@@ -7542,6 +8183,17 @@ auto GraphBuilderTflite::SerializeInstanceNormalization(
+       context_properties_.data_type_limits.instance_normalization_input
+           .Supports(
+               GetOperand(instance_normalization.input_operand_id).descriptor));
++
++  // Try the fused `custom_call.GroupNorm` path first. If any precondition
++  // fails, fall through to the primitive emulation below.
++// #if BUILDFLAG(WEBNN_USE_WEBGPU_ACCELERATOR)
++  if (auto fused =
++          SerializeInstanceNormalizationAsCustomCall(instance_normalization);
++      fused.has_value()) {
++    return *fused;
++  }
++// #endif  // BUILDFLAG(WEBNN_USE_WEBGPU_ACCELERATOR)
++
+   ASSIGN_OR_RETURN(
+       const TensorInfo& input_tensor_info,
+       SerializeInputTensorInfo(instance_normalization.input_operand_id));
+@@ -7710,12 +8362,12 @@ auto GraphBuilderTflite::SerializeLayerNormalization(
+ 
+   // Try the fused `custom_call.LayerNorm` path first. If any precondition
+   // fails, fall through to the primitive emulation below.
+-#if BUILDFLAG(WEBNN_USE_WEBGPU_ACCELERATOR)
++// #if BUILDFLAG(WEBNN_USE_WEBGPU_ACCELERATOR)
+   if (auto fused = SerializeLayerNormalizationAsCustomCall(layer_normalization);
+       fused.has_value()) {
+     return *fused;
+   }
+-#endif  // BUILDFLAG(WEBNN_USE_WEBGPU_ACCELERATOR)
++// #endif  // BUILDFLAG(WEBNN_USE_WEBGPU_ACCELERATOR)
+   ASSIGN_OR_RETURN(
+       const TensorInfo& input_tensor_info,
+       SerializeInputTensorInfo(layer_normalization.input_operand_id));
+diff --git a/services/webnn/tflite/graph_builder_tflite.h b/services/webnn/tflite/graph_builder_tflite.h
+index e78434fd00..7ca1d078a5 100644
+--- a/services/webnn/tflite/graph_builder_tflite.h
++++ b/services/webnn/tflite/graph_builder_tflite.h
+@@ -16,6 +16,7 @@
+ #include "base/containers/flat_set.h"
+ #include "base/containers/span.h"
+ #include "base/files/file.h"
++#include "base/memory/raw_ptr.h"
+ #include "base/memory/raw_ref.h"
+ #include "base/memory/stack_allocated.h"
+ #include "base/types/expected.h"
+@@ -804,6 +805,11 @@ class GraphBuilderTflite final {
+ 
+   base::expected<OperatorOffset, std::string> SerializeInstanceNormalization(
+       const mojom::InstanceNormalization& instance_normalization);
++  // Emits a `custom_call.GroupNorm` custom op (instance norm == group norm
++  // with one channel per group) if supported by `context_device_`. Returns
++  // `std::nullopt` otherwise.
++  std::optional<OperatorOffset> SerializeInstanceNormalizationAsCustomCall(
++      const mojom::InstanceNormalization& instance_normalization);
+   base::expected<OperatorOffset, std::string> SerializeLayerNormalization(
+       const mojom::LayerNormalization& layer_normalization);
+   // Emits a `custom_call.LayerNorm` custom op if supported by
+@@ -904,6 +910,83 @@ class GraphBuilderTflite final {
+   base::expected<std::optional<FusedActivationOutputInfo>, std::string>
+   CanFuseActivationAndGetOutput(OperandId output_operand_id);
+ 
++  // One matched decomposed scaled-dot-product-attention chain. All pointers
++  // are non-owning and point into `graph_info_`, which outlives the builder.
++  struct ScaledDotProductAttentionFusion {
++    raw_ptr<const mojom::Transpose> transpose;
++    raw_ptr<const mojom::Matmul> matmul1;
++    // Null unless the scale operand is produced by a DequantizeLinear.
++    raw_ptr<const mojom::DequantizeLinear> scale_dequantize;
++    raw_ptr<const mojom::ElementWiseBinary> mul;
++    raw_ptr<const mojom::Softmax> softmax;
++    raw_ptr<const mojom::Matmul> matmul2;
++    OperandId q_operand_id;
++    OperandId k_operand_id;
++    OperandId v_operand_id;
++    float scale;
++  };
++
++  // Detects the decomposed scaled-dot-product-attention pattern anchored at
++  // `transpose` (expected shape: Transpose(K) -> Matmul(Q, K^T) ->
++  // Mul(scale) -> Softmax -> Matmul(., V), with `scale` optionally produced
++  // by a DequantizeLinear). On a match, records the chain in
++  // `sdpa_fusions_` keyed by the final Matmul's `OperationId` and adds every
++  // other operation of the chain to `fused_ops_to_skip_`.
++  //
++  // This runs as a pre-pass over the whole graph, before any operation is
++  // serialized, because the composite has to be emitted at the *last*
++  // operation of the chain rather than at `transpose`: Q and V are only
++  // required by operations further down the chain, so their producing
++  // operations may well be serialized after `transpose`. Emitting the
++  // composite (and the reshapes feeding it) at `transpose` would then
++  // reference tensors that no operator has written yet, and TFLite executes
++  // operators in list order.
++  void RecordScaledDotProductAttentionFusion(const mojom::Transpose& transpose,
++                                             OperationId transpose_id);
++
++  // Emits the `STABLEHLO_COMPOSITE` operator
++  // (`odml.scaled_dot_product_attention`) for an already-matched chain,
++  // backed by a decomposition subgraph that replays the original ops
++  // unmodified (so CPU/XNNPACK execution is unaffected). Called when
++  // serialization reaches the chain's final Matmul.
++  base::expected<OperatorOffset, std::string>
++  SerializeScaledDotProductAttentionComposite(
++      const ScaledDotProductAttentionFusion& fusion);
++
++  // Returns the float value of `operand_id` if it is (or is produced by a
++  // DequantizeLinear wrapping) a compile-time-constant scalar, folding the
++  // dequantize formula in C++. Returns `std::nullopt` otherwise.
++  std::optional<float> GetEffectiveScalarScale(OperandId operand_id);
++
++  // Builds a decomposition subgraph containing the exact original
++  // Transpose/Matmul/[Dequantize]/Mul/Softmax/Matmul op sequence matched by
++  // `RecordScaledDotProductAttentionFusion`, appends it to
++  // `decomposition_subgraphs_`, and returns its subgraph index (relative to
++  // the final model, i.e. main subgraph is index 0).
++  // `q_tensor_info`/`k_tensor_info`/`v_tensor_info`/`output_tensor_info` are
++  // the tensors already assigned to the composite's boundary in the main
++  // graph (via `SerializeScaledDotProductAttentionComposite`'s own
++  // `SerializeInputTensorInfo`/`SerializeOutputTensorInfo` calls); the
++  // subgraph's corresponding operands are pre-seeded with these exact types
++  // so they structurally match the composite operator's declared types in
++  // the main graph -- the TFLite runtime requires this for the CPU/XNNPACK
++  // decomposition-subgraph fallback to allocate tensors successfully.
++  base::expected<int32_t, std::string>
++  BuildScaledDotProductAttentionDecompositionSubgraph(
++      const mojom::Transpose& transpose,
++      const mojom::Matmul& matmul1,
++      const mojom::DequantizeLinear* scale_dequantize,
++      const mojom::ElementWiseBinary& mul,
++      const mojom::Softmax& softmax,
++      const mojom::Matmul& matmul2,
++      OperandId q_operand_id,
++      OperandId k_operand_id,
++      OperandId v_operand_id,
++      const TensorInfo& q_tensor_info,
++      const TensorInfo& k_tensor_info,
++      const TensorInfo& v_tensor_info,
++      const TensorInfo& output_tensor_info);
++
+   // Check if inputs and outputs are quantized tensors and matches
+   // op specific fusion criteria required by TFLite, if so we can remove the
+   // preceding `dequantizeLinear` and subsequent `quantizeLinear`.
+@@ -1118,6 +1201,19 @@ class GraphBuilderTflite final {
+ 
+   base::flat_set<OperationId> fused_ops_to_skip_;
+ 
++  // Scaled-dot-product-attention chains found by
++  // `RecordScaledDotProductAttentionFusion`, keyed by the `OperationId` of
++  // each chain's final Matmul -- the operation at which the composite is
++  // emitted. Every other operation of a recorded chain is in
++  // `fused_ops_to_skip_`.
++  base::flat_map<OperationId, ScaledDotProductAttentionFusion> sdpa_fusions_;
++
++  // Decomposition subgraphs referenced by `STABLEHLO_COMPOSITE` operators
++  // emitted by `SerializeScaledDotProductAttentionComposite`, appended after
++  // the main subgraph (index 0) in `FinishAndTakeResult`.
++  std::vector<flatbuffers::Offset<::tflite::SubGraph>>
++      decomposition_subgraphs_;
++
+   // Mapping of the offset to scale_operand_id and zero_point_operand_id.
+   // Because there is no way to retrieve the underlying data from the flatbuffer
+   // offset, we store mapping to constant operands to check when encountering
+-- 
+2.55.0.windows.4
+

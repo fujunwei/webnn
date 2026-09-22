@@ -10,20 +10,21 @@
 
 param(
     [ValidateSet("dbg","opt")] [string]$Mode = "dbg",
-    [string]$ChromiumSrc = "C:\Users\awx_localadmin\workspace\chromium\src",
-    [string]$WebnnDir    = "C:\Users\awx_localadmin\workspace\webnn",
-    [string]$MlDrift     = "C:\Users\awx_localadmin\workspace\chromium\src\third_party\ml-drift",
+    [string]$ChromiumSrc,   # default: %USERPROFILE%\workspace\chromium\src  (or $env:CHROMIUM_SRC)
+    [string]$WebnnDir,      # default: dir containing this bundle           (or $env:WEB_NN)
+    [string]$MlDrift,       # default: %CHROMIUM_SRC%\third_party\ml-drift   (or $env:ML_DRIFT_DIR)
     # Git-for-Windows bash.exe used as Bazel's --shell_executable. Auto-detected
     # when empty (machine-wide install, then per-user under %LOCALAPPDATA%).
     [string]$Bash        = ""
 )
 
-$ErrorActionPreference = "Continue"
+. "$PSScriptRoot\common.ps1"
 
-# Refresh PATH from the registry (Machine + User) so freshly installed tools
-# (bazel, python) are found even when the invoking shell has a stale env.
-$env:Path = [Environment]::GetEnvironmentVariable("Path", "Machine") + ";" +
-            [Environment]::GetEnvironmentVariable("Path", "User")
+$ChromiumSrc = Resolve-BundlePath $ChromiumSrc "CHROMIUM_SRC" $DefaultChromiumSrc
+$WebnnDir    = Resolve-BundlePath $WebnnDir "WEB_NN" $WebnnRoot
+$MlDrift     = Resolve-BundlePath $MlDrift "ML_DRIFT_DIR" $DefaultMlDrift
+
+$ErrorActionPreference = "Continue"
 
 # Bazel fetches external repos (FP16, XNNPACK, farmhash, ...) with its own Java
 # HTTP client, which reads HTTP_PROXY/HTTPS_PROXY and ignores the WinINET proxy

@@ -1,0 +1,17 @@
+﻿diff --git a/ml_drift/webgpu/BUILD b/ml_drift/webgpu/BUILD
+index 167d6b5..944a748 100644
+--- a/ml_drift/webgpu/BUILD
++++ b/ml_drift/webgpu/BUILD
+@@ -227,8 +227,10 @@ cc_library(
+         "@com_google_absl//absl/status",
+         "@com_google_absl//absl/status:status_macros",
+         "@com_google_absl//absl/strings",
+-        "@dawn//:webgpu_dawn",
+-    ],
++    ] + select({
++        ":ml_drift_use_dawn_proc": ["@dawn//:libdawn_proc"],
++        "//conditions:default": ["@dawn//:webgpu_dawn"],
++    }),
+ )
+ 
+ cc_library(
