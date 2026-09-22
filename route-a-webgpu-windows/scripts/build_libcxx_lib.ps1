@@ -12,7 +12,7 @@
 # Output: $DEST\libc++.lib (~3 MB)
 
 param(
-    [string]$ChromiumSrc,   # default: %USERPROFILE%\workspace\chromium\src (or $env:CHROMIUM_SRC)
+    [string]$ChromiumSrc,   # default: %WORKSPACE_ROOT%\chromium\src (or $env:CHROMIUM_SRC)
     [string]$Dest           # default: <webnn>\_cr_libcxx_link_win       (or $env:CR_LIBCXX_DEST)
 )
 

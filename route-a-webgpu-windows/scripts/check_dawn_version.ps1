@@ -12,7 +12,7 @@
 #   .\check_dawn_version.ps1 -ChromeOutDir <chromium src>\out\upstream_bots_debug
 
 param(
-    [string]$ChromiumSrc,   # default: %USERPROFILE%\workspace\chromium\src (or $env:CHROMIUM_SRC)
+    [string]$ChromiumSrc,   # default: %WORKSPACE_ROOT%\chromium\src (or $env:CHROMIUM_SRC)
     [string]$ChromeOutDir   # default: %CHROMIUM_SRC%\out\Release
 )
 

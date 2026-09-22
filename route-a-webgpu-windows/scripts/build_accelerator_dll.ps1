@@ -10,7 +10,7 @@
 
 param(
     [ValidateSet("dbg","opt")] [string]$Mode = "dbg",
-    [string]$ChromiumSrc,   # default: %USERPROFILE%\workspace\chromium\src  (or $env:CHROMIUM_SRC)
+    [string]$ChromiumSrc,   # default: %WORKSPACE_ROOT%\chromium\src  (or $env:CHROMIUM_SRC)
     [string]$WebnnDir,      # default: dir containing this bundle           (or $env:WEB_NN)
     [string]$MlDrift,       # default: %CHROMIUM_SRC%\third_party\ml-drift   (or $env:ML_DRIFT_DIR)
     # Git-for-Windows bash.exe used as Bazel's --shell_executable. Auto-detected

@@ -27,7 +27,7 @@ param(
     # A `python.exe` alias is created next to it if missing, because Dawn's CMake
     # scripts and some generators invoke bare `python`.
     [string]$PythonDir        = "",
-    [string]$DepotTools        # default: %USERPROFILE%\workspace\depot_tools (or $env:DEPOT_TOOLS)
+    [string]$DepotTools        # default: %WORKSPACE_ROOT%\depot_tools (or $env:DEPOT_TOOLS)
 )
 
 . "$PSScriptRoot\common.ps1"
