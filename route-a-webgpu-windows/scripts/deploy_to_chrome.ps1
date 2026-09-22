@@ -3,8 +3,12 @@
 param(
     [Parameter(Mandatory=$true)] [string]$ChromeOutDir,
     [ValidateSet("dbg","opt")]   [string]$Mode = "dbg",
-    [string]$ChromiumSrc = "C:\Users\awx_localadmin\workspace\chromium\src"
+    [string]$ChromiumSrc   # default: %USERPROFILE%\workspace\chromium\src (or $env:CHROMIUM_SRC)
 )
+
+. "$PSScriptRoot\common.ps1"
+
+$ChromiumSrc = Resolve-BundlePath $ChromiumSrc "CHROMIUM_SRC" $DefaultChromiumSrc
 
 $ErrorActionPreference = "Stop"
 

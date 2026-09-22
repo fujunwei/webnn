@@ -2,7 +2,7 @@
 # Chromium out dir, then build mini_installer.exe.
 #
 # Usage (typical):
-#   .\build_mini_installer.ps1 -ChromeOutDir "C:\Users\awx_localadmin\workspace\chromium\src\out\Release"
+#   .\build_mini_installer.ps1 -ChromeOutDir "$env:USERPROFILE\workspace\chromium\src\out\Release"
 #
 # Prereqs:
 #   - `build_accelerator_dll.ps1 -Mode opt` succeeded → libLiteRtWebGpuAccelerator.dll in bazel-bin
@@ -15,11 +15,16 @@
 
 param(
     [Parameter(Mandatory=$true)] [string]$ChromeOutDir,
-    [string]$ChromiumSrc = "C:\Users\awx_localadmin\workspace\chromium\src",
-    [string]$WebnnDir    = "C:\Users\awx_localadmin\workspace\webnn",
+    [string]$ChromiumSrc,   # default: %USERPROFILE%\workspace\chromium\src  (or $env:CHROMIUM_SRC)
+    [string]$WebnnDir,      # default: dir containing this bundle           (or $env:WEB_NN)
     [switch]$SkipStage,        # skip DLL copy step (use whatever is already in out dir)
     [switch]$SkipBuild         # only stage, don't run autoninja
 )
+
+. "$PSScriptRoot\common.ps1"
+
+$ChromiumSrc = Resolve-BundlePath $ChromiumSrc "CHROMIUM_SRC" $DefaultChromiumSrc
+$WebnnDir    = Resolve-BundlePath $WebnnDir "WEB_NN" $WebnnRoot
 
 $ErrorActionPreference = "Stop"
 

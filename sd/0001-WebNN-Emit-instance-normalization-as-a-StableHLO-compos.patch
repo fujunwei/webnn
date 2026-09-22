@@ -1,0 +1,386 @@
+diff --git a/services/webnn/tflite/graph_builder_tflite.cc b/services/webnn/tflite/graph_builder_tflite.cc
+index 386365619b..7ced880936 100644
+--- a/services/webnn/tflite/graph_builder_tflite.cc
++++ b/services/webnn/tflite/graph_builder_tflite.cc
+@@ -88,8 +88,9 @@ constexpr size_t kFlatbufferSafetyThreshold = 1536 * 1024 * 1024; /* 1.5 GiB */
+ // The largest kernel tile size used by ruy's packing kernels (AVX-512 uses 16).
+ constexpr int32_t kMaxKernelBlockSize = 16;
+ 
+-// `sub_type` value of the `odml.group_norm` composite that selects layer
+-// normalization rather than group normalization.
++// `sub_type` values of the `odml.group_norm` composite, which is overloaded to
++// carry both group and layer normalization.
++constexpr int32_t kGroupNormSubTypeGroupNorm = 0;
+ constexpr int32_t kGroupNormSubTypeLayerNorm = 1;
+ 
+ // The maximum input rank that TFLite's broadcasting binary operators natively
+@@ -7591,6 +7592,144 @@ auto GraphBuilderTflite::SerializeIdentityOperation(OperandId input_operand_id,
+   return OperatorOffset{};  // null
+ }
+ 
++auto GraphBuilderTflite::SerializeInstanceNormalizationAsComposite(
++    const mojom::InstanceNormalization& instance_normalization)
++    -> std::optional<OperatorOffset> {
++  // Gate: the fused kernel is only reachable when the ML Drift WebGPU
++  // accelerator is selected. On other devices the composite would be evaluated
++  // through its decomposition subgraph, which is slower than emitting the
++  // primitives into the main subgraph directly.
++  if (context_device_ != mojom::Device::kGpu) {
++    return std::nullopt;
++  }
++
++  const mojom::Operand& input_operand =
++      GetOperand(instance_normalization.input_operand_id);
++  const auto& input_shape = input_operand.descriptor.shape();
++  const OperandDataType input_dtype = input_operand.descriptor.data_type();
++
++  // ML Drift requires a 4-D channels-last input; `IsGroupNormSupported()` in
++  // `third_party/litert/src/ml_drift_delegate/tflite/support/support_group_norm.cc`
++  // rejects any other rank outright.
++  if (input_shape.size() != 4) {
++    return std::nullopt;
++  }
++  if (input_dtype != OperandDataType::kFloat32 &&
++      input_dtype != OperandDataType::kFloat16) {
++    return std::nullopt;
++  }
++  CHECK_EQ(context_properties_.input_operand_layout, InputOperandLayout::kNhwc);
++
++  // ML Drift reads the scale and bias operands as constant tensors, so a
++  // computed operand cannot be lowered.
++  const uint32_t channels = input_shape.back();
++  auto is_valid_param = [&](OperandId operand_id) -> bool {
++    const mojom::Operand& op = GetOperand(operand_id);
++    if (op.kind != mojom::Operand::Kind::kConstant) {
++      return false;
++    }
++    if (op.descriptor.data_type() != OperandDataType::kFloat32 &&
++        op.descriptor.data_type() != OperandDataType::kFloat16) {
++      return false;
++    }
++    const auto& s = op.descriptor.shape();
++    return s.size() == 1 && s[0] == channels;
++  };
++  if (instance_normalization.scale_operand_id &&
++      !is_valid_param(*instance_normalization.scale_operand_id)) {
++    return std::nullopt;
++  }
++  if (instance_normalization.bias_operand_id &&
++      !is_valid_param(*instance_normalization.bias_operand_id)) {
++    return std::nullopt;
++  }
++
++  // All preconditions satisfied — emit the composite op.
++  ASSIGN_OR_RETURN(
++      const TensorInfo& input_tensor_info,
++      SerializeInputTensorInfo(instance_normalization.input_operand_id),
++      [](auto) { return std::nullopt; });
++  CHECK_EQ(input_tensor_info.data_type, ::tflite::TensorType_FLOAT32);
++  // ML Drift dereferences `gamma`/`beta` unconditionally when lowering the
++  // composite, indexing a vector it never resized if the attribute is absent
++  // (see `MakeGroupNorm()` in
++  // `third_party/ml-drift/ml_drift/common/selectors/operation_selector.cc`).
++  // Always hand it all three operands, materializing the identity values for
++  // any the WebNN operation omits.
++  ASSIGN_OR_RETURN(const TensorIndex scale_tensor_index,
++                   SerializeNormalizationParameter(
++                       instance_normalization.scale_operand_id, channels,
++                       /*default_value=*/1.0f),
++                   [](auto) { return std::nullopt; });
++  ASSIGN_OR_RETURN(const TensorIndex bias_tensor_index,
++                   SerializeNormalizationParameter(
++                       instance_normalization.bias_operand_id, channels,
++                       /*default_value=*/0.0f),
++                   [](auto) { return std::nullopt; });
++  const std::array<TensorIndex, 3> op_inputs = {
++      input_tensor_info.index, scale_tensor_index, bias_tensor_index};
++  ASSIGN_OR_RETURN(
++      const TensorInfo output_tensor_info,
++      SerializeOutputTensorInfo(instance_normalization.output_operand_id),
++      [](auto) { return std::nullopt; });
++  const std::array<TensorIndex, 1> op_outputs = {output_tensor_info.index};
++
++  // The composite advertises the group-normalization reduction axes below, but
++  // `num_groups == channels` narrows the statistics to each channel
++  // individually, so the equivalent primitive decomposition reduces over the
++  // spatial axes only. Getting this wrong would make the CPU fallback disagree
++  // with the delegated kernel.
++  const std::array<int32_t, 2> decomposition_reduction_axes = {1, 2};
++  ASSIGN_OR_RETURN(
++      const int32_t decomposition_subgraph_index,
++      SerializeNormalizationDecompositionSubgraph(
++          input_tensor_info.dimensions, decomposition_reduction_axes,
++          input_tensor_info.data_type, instance_normalization.epsilon,
++          "instance_norm_decomposition"),
++      [](auto) { return std::nullopt; });
++
++  // Attributes flexbuffer. Instance normalization is group normalization where
++  // every channel forms its own group, which ML Drift lowers to a dedicated
++  // `group_size == 1` kernel (see `HWCGroupNorm()` in
++  // `third_party/ml-drift/ml_drift/common/gpu_model_builder.cc`).
++  const int32_t channel_axis =
++      base::checked_cast<int32_t>(input_shape.size()) - 1;
++  flexbuffers::Builder fbb;
++  fbb.Map([&] {
++    fbb.Int("sub_type", kGroupNormSubTypeGroupNorm);
++    fbb.Int("num_groups", base::checked_cast<int32_t>(channels));
++    fbb.Float("epsilon", instance_normalization.epsilon);
++    fbb.Int("channel_axis", channel_axis);
++    // Group normalization declares every axis but the leading batch axis as a
++    // reduction axis; `IsGroupNormSupported()` rejects anything else.
++    fbb.Map("_TENSOR_V1_reduction_axes", [&] {
++      fbb.Vector("TENSOR_DATA", [&] {
++        for (int32_t axis = 1; axis <= channel_axis; ++axis) {
++          fbb.Add(axis);
++        }
++      });
++    });
++  });
++  fbb.Finish();
++  const auto composite_attributes = builder_.CreateVector(fbb.GetBuffer());
++  const auto composite_options = ::tflite::CreateStableHLOCompositeOptions(
++      builder_, builder_.CreateString("odml.group_norm"),
++      decomposition_subgraph_index, composite_attributes,
++      ::tflite::CustomOptionsFormat_FLEXBUFFERS, /*version=*/1);
++
++  return ::tflite::CreateOperator(
++      builder_,
++      GetOperatorCodeIndex(::tflite::BuiltinOperator_STABLEHLO_COMPOSITE),
++      builder_.CreateVector<TensorIndex>(op_inputs),
++      builder_.CreateVector<TensorIndex>(op_outputs),
++      ::tflite::BuiltinOptions_NONE, /*builtin_options=*/0,
++      /*custom_options=*/0, ::tflite::CustomOptionsFormat_FLEXBUFFERS,
++      /*mutating_variable_inputs=*/0, /*intermediates=*/0,
++      /*large_custom_options_offset=*/0, /*large_custom_options_size=*/0,
++      ::tflite::BuiltinOptions2_StableHLOCompositeOptions,
++      composite_options.Union());
++}
++
+ auto GraphBuilderTflite::SerializeInstanceNormalization(
+     const mojom::InstanceNormalization& instance_normalization)
+     -> base::expected<OperatorOffset, std::string> {
+@@ -7598,6 +7737,15 @@ auto GraphBuilderTflite::SerializeInstanceNormalization(
+       context_properties_.data_type_limits.instance_normalization_input
+           .Supports(
+               GetOperand(instance_normalization.input_operand_id).descriptor));
++
++  // Try the fused `odml.group_norm` composite path first. If any precondition
++  // fails, fall through to the primitive emulation below.
++  if (auto fused =
++          SerializeInstanceNormalizationAsComposite(instance_normalization);
++      fused.has_value()) {
++    return *fused;
++  }
++
+   ASSIGN_OR_RETURN(
+       const TensorInfo& input_tensor_info,
+       SerializeInputTensorInfo(instance_normalization.input_operand_id));
+@@ -7656,12 +7804,27 @@ auto GraphBuilderTflite::SerializeInstanceNormalization(
+       reshape_bias_tensor_index);
+ }
+ 
+-auto GraphBuilderTflite::SerializeLayerNormalizationDecompositionSubgraph(
++auto GraphBuilderTflite::SerializeNormalizationParameter(
++    std::optional<OperandId> operand_id,
++    uint32_t size,
++    float default_value) -> base::expected<TensorIndex, std::string> {
++  if (operand_id) {
++    ASSIGN_OR_RETURN(const TensorInfo& tensor_info,
++                     SerializeInputTensorInfo(*operand_id));
++    return tensor_info.index;
++  }
++  const std::vector<float> buffer(size, default_value);
++  const std::array<int32_t, 1> dimensions = {
++      base::checked_cast<int32_t>(size)};
++  return SerializeTensorWithBuffer<float>(buffer, dimensions);
++}
++
++auto GraphBuilderTflite::SerializeNormalizationDecompositionSubgraph(
+     base::span<const int32_t> input_dimensions,
++    base::span<const int32_t> reduction_axes,
+     ::tflite::TensorType tensor_type,
+     float epsilon,
+-    bool has_scale,
+-    bool has_bias) -> base::expected<int32_t, std::string> {
++    const char* subgraph_name) -> base::expected<int32_t, std::string> {
+   // Tensor indices are subgraph-local, so the decomposition is built into a
+   // scratch tensor/operator list. `buffers_` and `operator_codes_` are
+   // model-global and keep being appended to as usual.
+@@ -7671,8 +7834,8 @@ auto GraphBuilderTflite::SerializeLayerNormalizationDecompositionSubgraph(
+   outer_operators.swap(operators_);
+ 
+   auto build = [&]() -> base::expected<SubGraphOffset, std::string> {
+-    // The subgraph signature must match the composite operator's operand list:
+-    // `[input, scale?, bias?] -> [output]`.
++    // The subgraph signature must match the composite operator's operand list,
++    // which is always `[input, scale, bias] -> [output]`.
+     std::vector<TensorIndex> subgraph_inputs;
+     subgraph_inputs.reserve(3);
+     auto add_input = [&](base::span<const int32_t> dimensions,
+@@ -7704,25 +7867,19 @@ auto GraphBuilderTflite::SerializeLayerNormalizationDecompositionSubgraph(
+           index, reshape_tensor_index, compatible_shape));
+       return reshape_tensor_index;
+     };
+-    std::optional<TensorIndex> scale_tensor_index;
+-    if (has_scale) {
+-      ASSIGN_OR_RETURN(scale_tensor_index, add_reshaped_parameter("scale"));
+-    }
+-    std::optional<TensorIndex> bias_tensor_index;
+-    if (has_bias) {
+-      ASSIGN_OR_RETURN(bias_tensor_index, add_reshaped_parameter("bias"));
+-    }
++    ASSIGN_OR_RETURN(const TensorIndex scale_tensor_index,
++                     add_reshaped_parameter("scale"));
++    ASSIGN_OR_RETURN(const TensorIndex bias_tensor_index,
++                     add_reshaped_parameter("bias"));
+ 
+     ASSIGN_OR_RETURN(const TensorIndex output_tensor_index,
+                      SerializeTemporaryTensorWithByteSizeCheck(input_dimensions,
+                                                                tensor_type));
+ 
+-    const std::array<int32_t, 1> normalized_axis = {
+-        base::checked_cast<int32_t>(input_dimensions.size()) - 1};
+     ASSIGN_OR_RETURN((const auto [mean_tensor_index, variance_tensor_index]),
+                      ComputeMeanAndVarianceForNormalization(
+                          input_dimensions, tensor_type, input_tensor_index,
+-                         normalized_axis));
++                         reduction_axes));
+     ASSIGN_OR_RETURN(
+         const OperatorOffset operator_offset,
+         SerializeNormalizationOperation(
+@@ -7737,7 +7894,7 @@ auto GraphBuilderTflite::SerializeLayerNormalizationDecompositionSubgraph(
+         builder_.CreateVector<TensorIndex>(subgraph_inputs),
+         builder_.CreateVector<TensorIndex>(subgraph_outputs),
+         builder_.CreateVector(operators_.data(), operators_.size()),
+-        builder_.CreateString("layer_norm_decomposition"));
++        builder_.CreateString(subgraph_name));
+   };
+   base::expected<SubGraphOffset, std::string> subgraph = build();
+ 
+@@ -7780,13 +7937,6 @@ auto GraphBuilderTflite::SerializeLayerNormalizationAsComposite(
+     return std::nullopt;
+   }
+ 
+-  // ML Drift indexes bias at inputs[2]; a `[x, bias]` inputs list would be
+-  // misinterpreted as `[x, scale]`. Bail on that shape.
+-  if (layer_normalization.bias_operand_id &&
+-      !layer_normalization.scale_operand_id) {
+-    return std::nullopt;
+-  }
+-
+   const uint32_t innermost_size = input_shape.back();
+   auto is_valid_param = [&](OperandId operand_id) -> bool {
+     const mojom::Operand& op = GetOperand(operand_id);
+@@ -7815,35 +7965,37 @@ auto GraphBuilderTflite::SerializeLayerNormalizationAsComposite(
+       SerializeInputTensorInfo(layer_normalization.input_operand_id),
+       [](auto) { return std::nullopt; });
+   CHECK_EQ(input_tensor_info.data_type, ::tflite::TensorType_FLOAT32);
+-  std::vector<TensorIndex> op_inputs;
+-  op_inputs.reserve(3);
+-  op_inputs.push_back(input_tensor_info.index);
+-  if (layer_normalization.scale_operand_id) {
+-    ASSIGN_OR_RETURN(
+-        const TensorInfo& scale_tensor_info,
+-        SerializeInputTensorInfo(*layer_normalization.scale_operand_id),
+-        [](auto) { return std::nullopt; });
+-    op_inputs.push_back(scale_tensor_info.index);
+-  }
+-  if (layer_normalization.bias_operand_id) {
+-    ASSIGN_OR_RETURN(
+-        const TensorInfo& bias_tensor_info,
+-        SerializeInputTensorInfo(*layer_normalization.bias_operand_id),
+-        [](auto) { return std::nullopt; });
+-    op_inputs.push_back(bias_tensor_info.index);
+-  }
++  // ML Drift dereferences `gamma`/`beta` unconditionally when lowering the
++  // composite, indexing a vector it never resized if the attribute is absent
++  // (see `MakeLayerNorm()` in
++  // `third_party/ml-drift/ml_drift/common/selectors/operation_selector.cc`).
++  // Always hand it all three operands, materializing the identity values for
++  // any the WebNN operation omits.
++  ASSIGN_OR_RETURN(const TensorIndex scale_tensor_index,
++                   SerializeNormalizationParameter(
++                       layer_normalization.scale_operand_id, innermost_size,
++                       /*default_value=*/1.0f),
++                   [](auto) { return std::nullopt; });
++  ASSIGN_OR_RETURN(const TensorIndex bias_tensor_index,
++                   SerializeNormalizationParameter(
++                       layer_normalization.bias_operand_id, innermost_size,
++                       /*default_value=*/0.0f),
++                   [](auto) { return std::nullopt; });
++  const std::array<TensorIndex, 3> op_inputs = {
++      input_tensor_info.index, scale_tensor_index, bias_tensor_index};
+   ASSIGN_OR_RETURN(
+       const TensorInfo output_tensor_info,
+       SerializeOutputTensorInfo(layer_normalization.output_operand_id),
+       [](auto) { return std::nullopt; });
+   const std::array<TensorIndex, 1> op_outputs = {output_tensor_info.index};
+ 
++  const std::array<int32_t, 1> decomposition_reduction_axes = {
++      base::checked_cast<int32_t>(input_tensor_info.dimensions.size()) - 1};
+   ASSIGN_OR_RETURN(const int32_t decomposition_subgraph_index,
+-                   SerializeLayerNormalizationDecompositionSubgraph(
++                   SerializeNormalizationDecompositionSubgraph(
+                        input_tensor_info.dimensions,
+-                       input_tensor_info.data_type, layer_normalization.epsilon,
+-                       layer_normalization.scale_operand_id.has_value(),
+-                       layer_normalization.bias_operand_id.has_value()),
++                       decomposition_reduction_axes, input_tensor_info.data_type,
++                       layer_normalization.epsilon, "layer_norm_decomposition"),
+                    [](auto) { return std::nullopt; });
+ 
+   // Attributes flexbuffer. `odml.group_norm` covers both group and layer
+diff --git a/services/webnn/tflite/graph_builder_tflite.h b/services/webnn/tflite/graph_builder_tflite.h
+index 66e58637e8..bef67de7a1 100644
+--- a/services/webnn/tflite/graph_builder_tflite.h
++++ b/services/webnn/tflite/graph_builder_tflite.h
+@@ -801,6 +801,15 @@ class GraphBuilderTflite final {
+ 
+   base::expected<OperatorOffset, std::string> SerializeInstanceNormalization(
+       const mojom::InstanceNormalization& instance_normalization);
++  // Emits a `BuiltinOperator_STABLEHLO_COMPOSITE` operator named
++  // `odml.group_norm` with `sub_type = 0` (GroupNorm) and `num_groups` equal to
++  // the number of channels, which makes each channel its own group — that is
++  // exactly instance normalization, and ML Drift lowers it to a dedicated
++  // group-size-1 kernel. Returns `std::nullopt` if the operation doesn't meet
++  // the kernel's preconditions, in which case the caller falls back to
++  // emulating instance normalization with primitives.
++  std::optional<OperatorOffset> SerializeInstanceNormalizationAsComposite(
++      const mojom::InstanceNormalization& instance_normalization);
+   base::expected<OperatorOffset, std::string> SerializeLayerNormalization(
+       const mojom::LayerNormalization& layer_normalization);
+   // Emits a `BuiltinOperator_STABLEHLO_COMPOSITE` operator named
+@@ -810,16 +819,27 @@ class GraphBuilderTflite final {
+   // caller falls back to emulating layer normalization with primitives.
+   std::optional<OperatorOffset> SerializeLayerNormalizationAsComposite(
+       const mojom::LayerNormalization& layer_normalization);
+-  // Appends a decomposition subgraph for layer normalization (innermost axis,
+-  // primitive operators) and returns its subgraph index, which composite
+-  // operators reference as a fallback when no delegate claims them.
++  // Appends a decomposition subgraph which normalizes over `reduction_axes`
++  // with primitive operators and returns its subgraph index, which composite
++  // operators reference as a fallback when no delegate claims them. The
++  // subgraph signature is always `[input, scale, bias] -> [output]`; callers
++  // must materialize scale and bias even when the WebNN operation omits them.
+   base::expected<int32_t, std::string>
+-  SerializeLayerNormalizationDecompositionSubgraph(
++  SerializeNormalizationDecompositionSubgraph(
+       base::span<const int32_t> input_dimensions,
++      base::span<const int32_t> reduction_axes,
+       ::tflite::TensorType tensor_type,
+       float epsilon,
+-      bool has_scale,
+-      bool has_bias);
++      const char* subgraph_name);
++  // Returns the tensor index of the scale or bias operand of a normalization
++  // composite. ML Drift indexes these operands positionally and dereferences
++  // them unconditionally, so an absent operand is materialized as a constant
++  // 1-D tensor of `size` elements filled with `default_value` rather than
++  // being left off the operand list.
++  base::expected<TensorIndex, std::string> SerializeNormalizationParameter(
++      std::optional<OperandId> operand_id,
++      uint32_t size,
++      float default_value);
+   base::expected<OperatorOffset, std::string> SerializeLeakyRelu(
+       const mojom::LeakyRelu& leaky_relu);
+   base::expected<OperatorOffset, std::string> SerializeLinear(

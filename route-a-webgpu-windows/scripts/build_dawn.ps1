@@ -12,25 +12,53 @@
 #
 # Notes:
 #   - Building Dawn from scratch takes ~30-60 minutes.
-#   - $ChromiumVersion should match the Chrome build the DLL will be loaded into.
+#   - The fetched Dawn commit must match Chromium's third_party/dawn checkout:
+#     the accelerator embeds the 20-byte SHA1 hash from this tree's
+#     dawn_version.h and dawnProcSetProcs() aborts on mismatch with the proc
+#     table Chromium passes at runtime (README §1.4b). Use
+#     scripts/check_dawn_version.ps1 to verify whether a rebuild is even needed.
 
 param(
-    [string]$SrcDir           = "C:\Users\awx_localadmin\workspace\webnn\_webgpu_dawn_src",
-    [string]$Dest             = "C:\Users\awx_localadmin\workspace\webnn\_dawn_prebuilt_win",
-    [string]$ChromiumVersion  = "155.0.8054.0",
+    [string]$SrcDir,           # default: <webnn>\_webgpu_dawn_src  (or $env:DAWN_SRC_DIR)
+    [string]$Dest,             # default: <webnn>\_dawn_prebuilt_win (or $env:DAWN_PREBUILT_DIR)
+    [string]$ChromiumVersion = "",   # default: read from $ChromiumSrc\chrome\VERSION
+    [string]$ChromiumSrc,      # only used to read chrome\VERSION (default as below)
     # Directory containing a python3.exe (depot_tools' bootstrapped CPython works).
     # A `python.exe` alias is created next to it if missing, because Dawn's CMake
     # scripts and some generators invoke bare `python`.
     [string]$PythonDir        = "",
-    [string]$DepotTools       = "C:\Users\junwei\workspace\depot_tools"
+    [string]$DepotTools        # default: %USERPROFILE%\workspace\depot_tools (or $env:DEPOT_TOOLS)
 )
 
-$ErrorActionPreference = "Stop"
+. "$PSScriptRoot\common.ps1"
 
-# Refresh PATH from the registry (Machine + User) so freshly installed tools
-# (cmake, python, git) are found even when the invoking shell has a stale env.
-$env:Path = [Environment]::GetEnvironmentVariable("Path", "Machine") + ";" +
-            [Environment]::GetEnvironmentVariable("Path", "User")
+$ChromiumSrc = Resolve-BundlePath $ChromiumSrc "CHROMIUM_SRC" $DefaultChromiumSrc
+$SrcDir      = Resolve-BundlePath $SrcDir "DAWN_SRC_DIR" $DefaultDawnSrc
+$Dest        = Resolve-BundlePath $Dest "DAWN_PREBUILT_DIR" $DefaultDawnPrebuilt
+$DepotTools  = Resolve-BundlePath $DepotTools "DEPOT_TOOLS" $DefaultDepotTools
+
+# Default the target version from the local Chromium checkout so that
+# "update Chromium, then rebuild" needs no manual version bump.
+if (-not $ChromiumVersion) {
+    $ChromiumVersion = [Environment]::GetEnvironmentVariable("CHROMIUM_VERSION")
+}
+if (-not $ChromiumVersion) {
+    $versionFile = Join-Path $ChromiumSrc "chrome\VERSION"
+    if (-not (Test-Path $versionFile)) {
+        throw "No -ChromiumVersion given, no CHROMIUM_VERSION env var, and $versionFile not found."
+    }
+    $v = @{}
+    Get-Content $versionFile | ForEach-Object {
+        if ($_ -match "^(\w+)=(\d+)$") { $v[$Matches[1]] = $Matches[2] }
+    }
+    if (-not $v.ContainsKey("MAJOR") -or -not $v.ContainsKey("BUILD")) {
+        throw "Cannot parse $versionFile (expected MAJOR/MINOR/BUILD/PATCH lines)."
+    }
+    $ChromiumVersion = "$($v['MAJOR']).$($v['MINOR']).$($v['BUILD']).$($v['PATCH'])"
+}
+Write-Host "Target Chromium version: $ChromiumVersion (from $ChromiumSrc\chrome\VERSION)"
+
+$ErrorActionPreference = "Stop"
 
 # ---- Python ----
 # Windows ships a `python.exe` App Execution Alias that only opens the Store, and
