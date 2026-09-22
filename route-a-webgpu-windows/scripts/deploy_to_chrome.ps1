@@ -3,7 +3,7 @@
 param(
     [Parameter(Mandatory=$true)] [string]$ChromeOutDir,
     [ValidateSet("dbg","opt")]   [string]$Mode = "dbg",
-    [string]$ChromiumSrc   # default: %USERPROFILE%\workspace\chromium\src (or $env:CHROMIUM_SRC)
+    [string]$ChromiumSrc   # default: %WORKSPACE_ROOT%\chromium\src (or $env:CHROMIUM_SRC)
 )
 
 . "$PSScriptRoot\common.ps1"

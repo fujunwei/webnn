@@ -32,19 +32,23 @@ Windows 自带的 `python.exe` 是仅会弹出 Microsoft Store 页面的"应用�
 
 ## 1. 一次性 Setup
 
-**脚本不再硬编码任何机器路径**——全部按「参数 > 环境变量 > 默认值」解析（默认值从 `%USERPROFILE%` 和 bundle 自身位置推导，规则见 `scripts/common.ps1` 头注释）。同一份 bundle 拷到任何机器/账号都能直接用；只有目录布局不标准时才需要设置环境变量（可写进 `$PROFILE` 永久生效）：
+**脚本不再硬编码任何机器路径**——全部按「参数 > 环境变量 > 默认值」解析（默认值从 `%WORKSPACE_ROOT%`、`%USERPROFILE%` 和 bundle 自身位置推导，规则见 `scripts/common.ps1` 头注释）。同一份 bundle 拷到任何机器/账号都能直接用；只有目录布局不标准时才需要设置环境变量（可写进 `$PROFILE` 永久生效）：
 
 ```powershell
-# 可选覆盖（默认值见括号）：
-#   $env:CHROMIUM_SRC        Chromium 检出（默认 %USERPROFILE%\workspace\chromium\src）
+# 可选覆盖（默认值见括号）。多 checkout / 非标准目录布局只需设 WORKSPACE_ROOT，
+# webnn、chromium、depot_tools 都是它的子目录：
+#   $env:WORKSPACE_ROOT      workspace 根目录（默认 %USERPROFILE%\workspace）
+#   $env:CHROMIUM_SRC        Chromium 检出（默认 %WORKSPACE_ROOT%\chromium\src）
 #   $env:WEB_NN              webnn 工作目录（默认 bundle 所在位置向上两级）
 #   $env:ML_DRIFT_DIR        ml-drift 检出（默认 %CHROMIUM_SRC%\third_party\ml-drift）
-#   $env:DEPOT_TOOLS         depot_tools（默认 %USERPROFILE%\workspace\depot_tools）
+#   $env:DEPOT_TOOLS         depot_tools（默认 %WORKSPACE_ROOT%\depot_tools）
 #   $env:DAWN_PREBUILT_DIR / DAWN_SRC_DIR / CR_LIBCXX_DEST（默认 webnn 下对应目录）
+# 例：$env:WORKSPACE_ROOT = "C:\Users\awx_localadmin\workspace"
 
 # 下面的变量只供手工命令（打 patch 等）使用，按实际 checkout 位置填写：
-$BUNDLE  = "<webnn>\route-a-webgpu-windows"          # 本 bundle 所在目录
-$CR      = "$env:USERPROFILE\workspace\chromium\src" # 与脚本默认值一致
+$env:WORKSPACE_ROOT = "C:\Users\awx_localadmin\workspace"
+$BUNDLE  = "${env:WORKSPACE_ROOT}\webnn\route-a-webgpu-windows" # 本 bundle 所在目录（未设 WORKSPACE_ROOT 时为 $env:USERPROFILE\workspace\webnn\route-a-webgpu-windows）
+$CR      = "${env:WORKSPACE_ROOT}\chromium\src"                # 与脚本默认值一致（未设 WORKSPACE_ROOT 时为 $env:USERPROFILE\workspace\chromium\src）
 $WEBNN   = Split-Path $BUNDLE -Parent
 $LITERT  = "$CR\third_party\litert\src"
 $MLDRIFT = "$CR\third_party\ml-drift"
@@ -124,9 +128,12 @@ patch 00 里的绝对路径是本机的，换机必改：
 
 ```powershell
 # 编辑 $LITERT\.bazelrc.user，替换：
-#   C:/Users/junwei/workspace/chromium/src  -> $CR
-#   C:/Users/junwei/workspace/webnn         -> $WEBNN
+#   C:/Users/junwei/workspace/chromium/src  -> $CR 的正斜杠形式
+#   C:/Users/junwei/workspace/webnn         -> $WEBNN 的正斜杠形式
 #   -march=sierraforest                        -> 本机 CPU 的合适值
+# （$CR / $WEBNN 按 §1 解析；设了 WORKSPACE_ROOT 时它们就是
+#   %WORKSPACE_ROOT%\chromium\src 和 %WORKSPACE_ROOT%\webnn，注意
+#   bazelrc 里必须用正斜杠）
 ```
 
 > **patch 02（`WORKSPACE` 的 `local_repository(name = "ml_drift", ...)`）也硬编码了本机绝对路径**，同样换机必改——否则 Bazel 会安安静静地从旧机器/旧账号的 ml-drift 检出读取 `@ml_drift`，本地对 `ml_drift/webgpu/BUILD` 的任何编辑都不会生效（也不会报错）。踩过这个坑的完整排查过程见 §5 第 16 条。
@@ -285,7 +292,7 @@ route-a-webgpu-windows/
 │   └── dawn_proc.cpp               # 1.4b: 手工 patch 过的 Dawn dawn_proc.cpp（去掉 3 个 Dawn 内部头依赖），
 │                                    #       build_dawn.ps1 每次运行都会拷进 _dawn_prebuilt_win/src/
 └── scripts/
-    ├── common.ps1                  # 路径统一解析：参数 > 环境变量 > 默认值（%USERPROFILE% + bundle 自身位置推导）
+    ├── common.ps1                  # 路径统一解析：参数 > 环境变量 > 默认值（WORKSPACE_ROOT / %USERPROFILE% + bundle 自身位置推导）
     ├── check_dawn_version.ps1      # 1.4b: 比对 prebuilt 与 Chromium 的 Dawn 20 字节 SHA1，判断是否要重跑 build_dawn.ps1
     ├── build_libcxx_lib.ps1        # 1.1: 打包 libc++.lib
     ├── build_dawn.ps1              # 1.2: 编 webgpu_dawn.dll + 拷贝 vendor/dawn_proc.cpp（含 python.exe 别名探测 + Dawn 分支自动回退 + 版本号自动读 chrome\VERSION）
