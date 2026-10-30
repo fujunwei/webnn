@@ -18,8 +18,8 @@ table there when adding a patch.
 
 | Patches | Repo |
 |---|---|
-| `01`–`13`, `28`–`30` (prefix `litert`) | `third_party\litert\src` |
-| `22`–`27`, `31`, `32`, `35` (prefix `mldrift`) | `third_party\ml-drift` |
+| `01`–`13`, `28`–`30`, `36`, `37` (prefix `litert`) | `third_party\litert\src` |
+| `22`–`27`, `31`, `32`, `35`, `38` (prefix `mldrift`) | `third_party\ml-drift` |
 | `34` (prefix `webnn`) | `chromium\src` itself |
 
 `litert/src` and `ml-drift` are their own git checkouts carrying bare
@@ -84,6 +84,8 @@ git apply --check --reverse <patch>
 | 29 | `ml_drift_delegate/tflite/model_builder.cc` | **actually permute constant data for rank-2/3 TRANSPOSE** |
 | 30 | `ml_drift_delegate/delegate/delegate_kernel.cc` | log the nodes the delegate really takes |
 | 33 | `ml_drift_delegate/tflite/model_builder.cc` | **broadcast BATCH_MATMUL batch axes** — B0 broadcast via TILE along H; B1 broadcast (constant right) via host-side interleave baked into the const node; other broadcast combos refuse and fall back to CPU. **Superseded by `34`, see note below.** |
+| 36 | `ml_drift_delegate/tflite/convert/convert_batch_matmul.cc` | **fix BATCH_MATMUL batch broadcast direction in the IrModel converter** — the same class of bug as `33`, independently reimplemented in the newer IrModel pipeline (a separate parser from `model_builder.cc`). See [36-ir-bmm-broadcast-and-conv-weights.zh.md](36-ir-bmm-broadcast-and-conv-weights.zh.md). |
+| 37 | `ml_drift_delegate/delegate/delegate_options.h` | default `use_ir_model` to `true` so the IrModel pipeline (and `36`'s fix) is actually exercised, not just the legacy `GraphFloat32` pipeline |
 
 ### chromium/src
 
@@ -104,6 +106,7 @@ git apply --check --reverse <patch>
 | 31 | `common/kernels/winograd.cc` | **bake Winograd Bt/At constants as FLOAT32** — f16 WGSL on devices without shader-f16 silently kills the whole dispatch (SAM fp16 all-zeros) |
 | 32 | `webgpu/webgpu_api_util.cc` | debug hook: `MLD_WEBGPU_SHADER_DUMP_DIR` dumps WGSL sources that mention f16 |
 | 35 | `common/kernels/conv_generic.cc` | **fall back to `kGlobalMemory` when conv weights exceed image2D limits** — the check existed only in `GetKernelParamsAdreno`; WARP/WebGPU generic paths emitted an invalid 16×65536 weights texture (SAM window attention) that silently zeroed the output |
+| 38 | `common/gpu_model_builder.cc` | **size BMM-as-conv weights layout by `dst_shape.h`, not the right operand's own `H*W`** — exposed by `36`'s broadcast fix producing a `dst_shape.h` larger than the right operand's row count; the packer under-allocated and the dwfh conv kernel read past the buffer. See [36-ir-bmm-broadcast-and-conv-weights.zh.md](36-ir-bmm-broadcast-and-conv-weights.zh.md) §3. |
 
 ## Notes
 
@@ -143,5 +146,17 @@ git apply --check --reverse <patch>
   in Chromium (it's already committed locally as `c6367c7848`, just not yet
   upstreamed). See [33-bmm-batch-broadcast.zh.md](33-bmm-batch-broadcast.zh.md)
   §9–§10 for the full design writeup and end-to-end verification.
+- **`36`/`37`/`38` fix the same class of `BATCH_MATMUL` broadcast bug as
+  `33`/`35`, but in the newer IrModel pipeline** (`ml_drift_delegate/tflite/convert/*`
+  + `ml-drift`'s `GpuModelBuilder`), which is a separate parser from the
+  legacy `GraphFloat32` pipeline `33` patches and is *not* superseded by `34`
+  (`34` only changes what shapes `graph_builder_tflite.cc` emits into the
+  `.tflite` file; both litert pipelines still need to handle whatever shapes
+  reach them correctly). `37` flips `use_ir_model`'s default to `true`,
+  which is what first exercises `36`'s converter and, transitively, exposes
+  `38`'s weights-packing bug in `ml-drift`. All three are sourced from real
+  commits (not bare working-tree edits) — see the `COMMITS` entries in
+  `tools/gen_patches.py`. Design writeup and a worked numeric example:
+  [36-ir-bmm-broadcast-and-conv-weights.zh.md](36-ir-bmm-broadcast-and-conv-weights.zh.md).
 
 See [../gpu_op_bisect.zh.md](../gpu_op_bisect.zh.md) for how these were found.
