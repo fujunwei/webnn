@@ -158,12 +158,77 @@ the output reads back all zeros.
 Move the same check into the generic GetKernelParams tail so every path
 degrades to global memory instead of emitting an invalid texture.""",
      [("ml_drift/common/kernels/conv_generic.cc", None)]),
+
+    ("36-litert-ir-bmm-batch-broadcast.patch", LITERT,
+     "litert: fix batch broadcast direction in the IR-pipeline BATCH_MATMUL converter",
+     """ConvertBatchMatMul (the ml_drift_delegate/tflite/convert/* front end used
+by the IrModel pipeline, a separate code path from the legacy
+model_builder.cc parser fixed by 33-litert-bmm-batch-broadcast.patch)
+flattens each operand's leading batch dims into a single axis before
+handing left/right to ml-drift's BatchedMatMul, e.g. left [B,H,M,K] ->
+[1,B*H,M,K]. ml-drift's BMM-as-conv kernel broadcasts a smaller right
+batch against the *last* dim of this flattened axis (i.e. against H),
+matching TFLite's BATCH_MATMUL only when the right operand's own
+broadcast dim is B (right = [1,H,K,N] with r.b==1). SAM's decoder
+instead broadcasts a right operand shaped [B,1,K,N] (r.b!=1, r.h==1)
+against a left [B,H,M,K] -- TFLite's right-aligned NumPy broadcast
+picks left's *outermost* batch dim (B), but ml-drift's flattened
+conv-as-matmul broadcasts against the innermost one (H), so every group
+but the first read the wrong right-hand rows.
+
+Detect this specific mismatch (left_is_5d and right_is_5d both false,
+l.b!=1, l.h!=1, r.b!=1, r.h==1) and swap the left operand's (b,h) axes
+with a TRANSPOSE before flattening, then swap the output back with a
+matching trailing TRANSPOSE, so ml-drift's last-dim broadcast lines up
+with the batch dim TFLite actually broadcasts against.""",
+     [("ml_drift_delegate/tflite/convert/convert_batch_matmul.cc", None)]),
+
+    ("37-litert-enable-ir-model-pipeline.patch", LITERT,
+     "litert: default the GPU delegate to the IrModel pipeline",
+     """use_ir_model gated which of two independent front ends builds the
+ml-drift graph: the legacy GraphFloat32 pipeline (model_builder.cc,
+fixed for BATCH_MATMUL broadcast by 33-litert-bmm-batch-broadcast.patch)
+or the newer IrModel pipeline (convert_batch_matmul.cc et al., fixed by
+36-litert-ir-bmm-batch-broadcast.patch). It defaulted to false, so the
+SAM decoder -- and any other model exercised through the default
+delegate options -- ran the legacy parser and never took the IrModel
+converter's batch-broadcast fix. Flip the default to true so the fixed
+pipeline is what actually executes; both pipelines remain compiled and
+selectable at runtime for callers that explicitly set the option.""",
+     [("ml_drift_delegate/delegate/delegate_options.h", None)]),
+
+    ("38-mldrift-bmm-conv-weights-dst-height.patch", MLDRIFT,
+     "ml-drift: size BMM-as-conv weights layout by dst height, not right H*W",
+     """GpuModelBuilder::BatchedMatMul's conv-based path always requests
+different_weights_for_height=true, so the packed conv weights buffer
+must have one row per destination row (0..dst_shape.h-1): the kernel
+indexes it by output row and broadcasts the right operand's batch over
+dst height. WeightsConversion was instead sized from the right
+operand's own OHWI shape (H*W = right's batch count), which only
+matches dst_shape.h when the right operand isn't broadcast. Once
+36-litert-ir-bmm-batch-broadcast.patch's left/right flattening produces
+a dst_shape.h larger than the right operand's H*W (e.g. dst_shape.h=6
+attention rows broadcasting right's 2 real K/V batches), the packer
+only wrote 2 rows and the kernel read rows 2-5 out of the allocated
+buffer, so 4 of every 6 attention blocks got garbage instead of the
+broadcast K/V weights.
+
+Grow only the layout's H so H*W == dst_shape.h, keeping W (the
+converter's source-row divisor, `sp % W`) equal to the right operand's
+real batch count, so the broadcast still cycles through the correct
+rows instead of just allocating more space.""",
+     [("ml_drift/common/gpu_model_builder.cc", None)]),
 ]
 
-# Patches sourced from a specific chromium/src commit instead of a bare
-# working-tree/staged diff (that repo commits its WebNN changes).
+# Patches sourced from a specific commit instead of a bare working-tree/staged
+# diff. Used for the chromium/src checkout (which commits its WebNN changes)
+# and for litert/ml-drift fixes that were committed on a feature branch rather
+# than left as uncommitted working-tree edits.
 COMMITS = {
     "34-webnn-matmul-batch-broadcast.patch": "c6367c7848",
+    "36-litert-ir-bmm-batch-broadcast.patch": "f0a65ed5e29dbec29d1a0f365d38e48da227bd47",
+    "37-litert-enable-ir-model-pipeline.patch": "75fc311ff27c99179984f6d931dada017a9243b4",
+    "38-mldrift-bmm-conv-weights-dst-height.patch": "8f7989895f8420a2b9975f1c5c620730a87f3fdd",
 }
 
 

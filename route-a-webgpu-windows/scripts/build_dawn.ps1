@@ -123,6 +123,26 @@ Write-Host "Set chromium_version.txt = $ChromiumVersion"
 $BuildDir = Join-Path $SrcDir "out\latest"
 New-Item -ItemType Directory -Force -Path $BuildDir | Out-Null
 
+# The chromium/<N> branch tip is not necessarily the commit Chromium's DEPS pins
+# (and on a bleeding-edge checkout the fallback branch is older), which would
+# fail the dawn_version.h hash check at runtime. If the Dawn source tree already
+# exists, move it to the exact commit of $ChromiumSrc\third_party\dawn and tell
+# FetchContent not to move it back.
+$dawnPin = (git -C (Join-Path $ChromiumSrc "third_party\dawn") rev-parse HEAD 2>$null)
+$dawnSrcTree = Join-Path $BuildDir "_deps\dawn-src"
+$extraCmakeArgs = @()
+if ($dawnPin -and (Test-Path $dawnSrcTree)) {
+    $dawnPin = $dawnPin.Trim()
+    $ErrorActionPreference = "Continue"
+    git -C $dawnSrcTree fetch origin $dawnPin 2>&1 | Out-Null
+    git -C $dawnSrcTree checkout --quiet $dawnPin 2>&1 | Out-Null
+    $rc = $LASTEXITCODE
+    $ErrorActionPreference = "Stop"
+    if ($rc -ne 0) { throw "Cannot check out Dawn $dawnPin in $dawnSrcTree" }
+    $extraCmakeArgs = @("-DFETCHCONTENT_UPDATES_DISCONNECTED_DAWN=ON")
+    Write-Host "Pinned Dawn source to Chromium's third_party/dawn commit $dawnPin"
+}
+
 Push-Location $BuildDir
 try {
     # See the note above: cmake streams status to stderr, so keep native-command
@@ -141,7 +161,8 @@ try {
         -UDAWN_BUILD_MONOLITHIC_LIBRARY `
         -UCMAKE_BUILD_TYPE `
         -DCMAKE_BUILD_TYPE=Release `
-        -DDAWN_BUILD_MONOLITHIC_LIBRARY=SHARED
+        -DDAWN_BUILD_MONOLITHIC_LIBRARY=SHARED `
+        @extraCmakeArgs
     if ($LASTEXITCODE -ne 0) { throw "cmake configure failed" }
 
     Write-Host "Building Dawn Release (this takes 30-60 min)..."

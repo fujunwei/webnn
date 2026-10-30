@@ -284,6 +284,258 @@ ml-drift WebGPU 回读默认 10 秒超时(这个模型在集显上要 ~19.5 秒)
 - 9/21 发现:真实模型的注意力链是 rank-3,rank-4 限制导致 0 次融合;
   选定方案 A(合成 4D reshape)后落地为当前实现。
 
+## 扩展:UNet 多头注意力融合(2026-10-14)
+
+### 起因
+
+用 `--webnn-tflite-dump-model-skip-weights` dump 出
+`tflite-dump-model/stable_diffusion/no_weights_model/unet.tflite` 后发现:
+`vae_decoder.tflite` 的那一个自注意力块已经融合成
+`STABLEHLO_COMPOSITE`,但 `unet.tflite` 里 **32 个 `SOFTMAX` 全部原样保留**
+(224 个 `BATCH_MATMUL`,0 处出现 `scaled_dot_product_attention`)——上面
+"匹配范围"一节描述的 matcher 只认单头,UNet 的 self/cross-attention 全是
+多头,完全匹配不上。
+
+### 诊断:UNet 注意力块的真实结构
+
+用 `flatc.exe --json --raw-binary` 把 `unet.tflite` 转 JSON 逐算子核对
+(权重被 skip-weights 清空,但 shape/type/op 序列完整),第一个 softmax
+(index 116)附近的算子链:
+
+```
+[103] BATCH_MATMUL  (1x4096x320, 320x960)      -> 1x4096x960   # 融合的 QKV 投影
+[104] SPLIT_V       -> 3x(1x4096x320)                          # 拆出 Q,K,V
+[105] RESHAPE       1x4096x320 -> 1x4096x5x64                  # Q split-heads
+[106] TRANSPOSE     1x4096x5x64 -> 1x5x4096x64   perm[0,2,1,3] # heads 前移
+[107] RESHAPE       1x4096x320 -> 1x4096x5x64                  # K
+[108] TRANSPOSE     1x4096x5x64 -> 1x5x64x4096   perm[0,2,3,1] # heads 前移 + 转置,一步到位
+[109] DEQUANTIZE    fp16 标量 scale 常量 -> fp32
+[110] MUL           (1x5x64x4096, scalar) -> same              # scale 乘在 Kᵀ 上
+[111] RESHAPE       1x4096x320 -> 1x4096x5x64                  # V
+[112] TRANSPOSE     1x4096x5x64 -> 1x5x4096x64   perm[0,2,1,3]
+[113] DEQUANTIZE    同一个 fp16 标量常量 -> fp32
+[114] MUL           (1x5x4096x64, scalar) -> same               # scale 乘在 Q 上
+[115] BATCH_MATMUL  Q·Kᵀ -> 1x5x4096x4096
+[116] SOFTMAX       axis=最后一维
+[117] BATCH_MATMUL  (·V) -> 1x5x4096x64
+[118] TRANSPOSE     1x5x4096x64 -> 1x4096x5x64   perm[0,2,1,3]  # heads 转回去
+[119] RESHAPE       1x4096x5x64 -> 1x4096x320                  # 合并 heads
+[121] BATCH_MATMUL  out-proj
+```
+
+全部 32 处注意力块分 8 种 shape 签名(16 个 self-attention + 16 个
+cross-attention,K/V 来自 77-token 文本 embedding),heads ∈ {5,10,20},
+head_dim 恒为 64,结构逐一致:
+
+| Q shape | Kᵀ / V seq | heads | 种类 | 出现次数 |
+|---|---|---|---|---|
+| 1x5x4096x64 | 4096 / 77 | 5 | self / cross | 各 5 |
+| 1x10x1024x64 | 1024 / 77 | 10 | self / cross | 各 5 |
+| 1x20x256x64 | 256 / 77 | 20 | self / cross | 各 5 |
+| 1x20x64x64 | 64 / 77 | 20 | self / cross(mid-block) | 各 1 |
+
+与原 matcher 假设的三处结构性差异,缺一都匹配不上:
+
+1. **布局**:Q/K/V 是 `[batch, heads, seq, head_dim]`(heads 在 axis 1),
+   原 matcher 要求 rank-4 时 `shape[2] == 1`(退化单头),直接拒绝。
+2. **scale 位置**:scale 被拆成两次,`Mul(K, s)` 和 `Mul(Q, s)`,各自
+   发生在 **matmul 之前**;原 matcher 假定 `Transpose(K)` 的唯一消费者
+   直接是 `matmul1`,这里唯一消费者是 `Mul`,第一步就匹配不上。
+3. **入口/出口 transpose**:head 的 reshape→transpose / transpose→reshape
+   搬运就发生在 matmul 链条的外侧,原 matcher 完全没有对接这部分的逻辑。
+
+### kernel 能力核实:heads>1 完全被支持,Chromium 注释本身是错的
+
+动手改代码前,先核实了两件事(各起了一个独立的调研 agent):
+
+**ml-drift**:`IsSdpaSupported`
+(`third_party/litert/src/ml_drift_delegate/tflite/support/support_sdpa.cc:32`)
+的维度检查完全没有限制 heads 轴;真正的 kernel `MakeScaledDotProductAttention`
+(`ml-drift/ml_drift/common/selectors/operation_selector.cc:52-97`)内部就是
+```cpp
+auto q_transposed = model_builder->Transpose(q, BHWC(0, 2, 1, 3));
+auto k_transposed = model_builder->Transpose(k, BHWC(0, 2, 3, 1));
+auto v_transposed = model_builder->Transpose(v, BHWC(0, 2, 1, 3));
+```
+把 heads 轴顶到 `BatchedMatMul` 的 batch 维上。决定性证据:ml-drift 自带的
+Stable Diffusion UNet 示例
+(`samples/stable_diffusion/unet_builder.cc:454-474`)做的就是完全相同的
+多头 attention,字节级同构。
+
+**XNNPACK**:`VisitDotAttentionNode`
+(`tflite/src/tensorflow/lite/delegates/xnnpack/xnnpack_delegate.cc:6411`)
+显式支持 MHA/MQA/GQA(`:6465-6469` 用 `key_proj.dims->data[2]` 判断是否
+MQA/GQA 并走专门的 regroup 路径),测试覆盖到 `q_heads=32`。rank 必须严格
+是 4(`:6473` 硬 `TF_LITE_ENSURE_EQ`),heads 轴固定读作倒数第二维
+(`permute_q = {0,2,1,3}`,`:6516-6517`)—— 这部分原注释是对的。
+
+两个 delegate 认领 `odml.scaled_dot_product_attention` 都**纯粹从 shape
+推断 heads 数**,composite 本身没有、也不需要携带 `num_heads` 属性。
+
+结论:`graph_builder_tflite.cc` 里原先 `q_shape[2] != 1` 这道门槛是
+Chromium 自己转换器的限制,不是 kernel 的限制;多头 UNet 注意力块理论上
+完全可以走融合路径,而且 **UNet 图里 heads 轴搬运的 transpose 本来就
+存在**(上面算子链的 106/108/112/118),融合时把它们吸收掉而不是新插入
+一份,composite 直接读写 `[batch, seq, heads, head_dim]`——与 kernel 要的
+布局完全一致,相当于**零额外数据搬运**的融合。
+
+GQA/MQA(K/V heads 少于 Q)被排除在匹配范围外:XNNPACK 有专门的 regroup
+路径处理,但 ml-drift 的 `IsSdpaSupported` 没有对应逻辑,两个 delegate
+行为会不一致,所以干脆不匹配这种情况,留给未融合路径。
+
+### 实现(`graph_builder_tflite.h`/`.cc`,`dump_larger_model` 分支,未提交)
+
+`bool rank3_chain` 换成三态枚举(`graph_builder_tflite.h:888`):
+
+```cpp
+enum class SdpaOperandLayout {
+  kRank3,           // [batch, seq, head_dim],原有的合成 4D reshape 路径
+  kRank4SeqHeads,   // [batch, seq, heads, head_dim],kernel 要的布局,原样直喂
+  kRank4HeadsSeq,   // [batch, heads, seq, head_dim],UNet 的真实布局,
+                    // 吸收前后的 transpose 而不是插入 reshape
+};
+```
+
+`ScaledDotProductAttentionFusion`(`:925`)按需扩成可选字段:
+`q_transpose`/`v_transpose`/`output_transpose`(吸收的四个 transpose 里的
+三个,K 的那个复用原有的 `transpose` 字段,因为它同时承担"转置"与"heads
+前移"两个作用)、`q_scale_dequantize`/`q_mul`、`k_scale_dequantize`/`k_mul`
+(拆开的两次 scale),原有的 `scale_dequantize`/`mul` 仍然保留用于
+"scale 乘在 matmul 结果上"这种(rank-3/rank-4-单头)情形。`scale` 字段
+现在是三处 scale 的乘积(`q_scale * k_scale * post_scale`,UNet 里
+`post_scale` 恒为 1,因为它压根没有第三次 scale)。
+
+新增一个以 **softmax 为锚点**的匹配器
+`RecordMultiHeadScaledDotProductAttentionFusion()`(`:8942`),与原有的
+以 `Transpose(K)` 为锚点的 `RecordScaledDotProductAttentionFusion()`
+并行跑(`CreateAndBuild()` 里先跑 transpose 扫描、再跑 softmax 扫描,
+`:812-841`,保证同一条链不会被两个 matcher 重复认领)。匹配步骤:
+
+1. `softmax.axis` 必须是最后一维(原 matcher 从未校验这个,是本次顺带
+   补上的缺口)。
+2. 剥离 softmax 输入上可能存在的 scale `Mul`——`TryResolveSdpaScaleMul()`
+   (`:8841`)：判断某个 operand 是否由一个"其中一个操作数是可解析标量
+   常量(或被 `dequantizeLinear` 包住)的 `Mul`"产生,如果是,剥掉它拿到
+   更上游的真实输入和这一步的浮点 scale;如果该 `Mul`(或其 scale 的
+   `dequantizeLinear`)还被别的地方消费,直接放弃匹配而不是部分融合。
+3. 顺着 `matmul1`→反查其 a/b 操作数各自是否也套了一层 `TryResolveSdpaScaleMul`
+   (对应 Q 和 K 各自的那次 scale)。
+4. `matmul2` 的左操作数必须正好是 softmax 输出(`matmul(V, weights)` 是
+   不同的计算,原 matcher 没卡这点,这里补上)。
+5. `GetAbsorbableSdpaTransposeId()`(`:8914`)分别检查 Q/K/V 的真实输入
+   是否各自经过一个**置换完全匹配**(`kSdpaHeadsFirstPermutation = {0,2,1,3}`
+   给 Q/V,`kSdpaHeadsFirstTransposedPermutation = {0,2,3,1}` 给 K——
+   heads 前移与"转置"一步到位)**且输出无其他消费者**的 `Transpose`;
+   同时检查 `matmul2` 输出之后是否跟着一个用同一置换转回去的
+   `Transpose`。四个条件但凡一个不满足就放弃。
+6. 最后校验 Q/K/V 三者 `[batch, heads, head_dim]` 必须一致、只允许 seq
+   长度不同(自注意力 vs 交叉注意力的唯一差异),显式排除 GQA/MQA。
+
+命中后把四个 transpose、`matmul1`、`softmax`、各处 scale 的 `Mul`/
+`DequantizeLinear` 一并记入 `fused_ops_to_skip_`,在 `matmul2` 的位置
+发射 composite——延续原有"在链条最后一个算子才发射"的两阶段设计,规避
+use-before-def。
+
+`SerializeScaledDotProductAttentionComposite()` /
+`BuildScaledDotProductAttentionDecompositionSubgraph()` 按 `fusion` 里
+哪些指针非空决定重放哪些算子(`kRank4HeadsSeq` 比原来多重放 4 个
+transpose 和 2 组 scale mul/dequantize),`kRank4SeqHeads`/`kRank4HeadsSeq`
+都不需要合成 reshape,`composite_output_tensor_index` 直接复用
+`SerializeOutputTensorInfo` 返回的 tensor——这两种布局下 composite 的
+输入输出形状本来就与 kernel 要的一致。
+
+### 当前状态:**融合计数已验证全量命中,数值/性能验证尚未做**
+
+重新 dump 出的 `model1.tflite`(用 `flatc.exe --json --raw-binary` 转
+JSON 后用脚本统计算子类型)确认:主图里 `SOFTMAX` 从 32 降到 **0**,新增
+**32** 个 `odml.scaled_dot_product_attention` composite,对应生成
+**32** 个 `scaled_dot_product_attention_decomposition` 子图(每个恰好
+1 个 `SOFTMAX` + 2 个 `BATCH_MATMUL`,即未融合时的原始算子,用于
+CPU/XNNPACK 没认领 composite 时的保真回退)。UNet 的 16 个 self-attention
++ 16 个 cross-attention 块**全部**命中多头匹配器,一个没漏。
+
+统计方法:
+
+```
+$outdir = "$env:TEMP\tflite_json"
+& flatc.exe --json --raw-binary --strict-json -o $outdir schema.fbs -- model1.tflite
+# 用 Python 读 JSON,按 operator_codes[opcode_index].builtin_code 分类计数,
+# 并在 STABLEHLO_COMPOSITE 上读 builtin_options_2.name 区分
+# odml.scaled_dot_product_attention / odml.group_norm 等不同 composite。
+```
+
+遗留的两个风险点仍未验证:
+
+1. **精度**:原图是 `(Q·s)·(K·s)ᵀ` 两次缩放后再相乘,融合后变成对
+   `matmul1` 的结果一次性乘 `s²`。数学上等价,但如果 kernel 内部实现是
+   在 `QKᵀ` **之后**才应用 scale(常见做法),这完全匹配;但要留意 fp16
+   累加路径上是否有任何一步因为合并而改变了中间量级。
+2. **回归**:`vae_decoder.tflite` 走的 `kRank3` 路径只是把原来的
+   `bool rank3_chain` 机械替换成枚举分支,语义上应该等价,但这次改动
+   没有重新单独验证它。
+
+验证计划(尚未执行):跑 SD-Turbo demo 页面肉眼比对出图;有空的话仿照
+2026-09-21 那次验证,extend `sam_encoder_runner` 或类似工具做 UNet
+粒度的 CPU vs GPU 数值 diff;以及下面的性能对比方法。
+
+## 性能对比方法:有/无 SDPA 融合(2026-10-14)
+
+不需要额外写代码,用已有的 feature flag + Chrome 内置 Perfetto tracing
+就能做 A/B 对比。
+
+### 1. 开关融合——feature flag
+
+复用"Feature flag"一节提到的 `kApplySdpaFusion`
+(`graph_builder_tflite.cc:73`,默认开启),命令行一个开关关掉:
+
+```
+# 有 SDPA 融合(默认)
+chrome.exe --no-sandbox --enable-features=WebMachineLearningNeuralNetwork \
+  --disable-features=WebNNDirectML,WebNNOnnxRuntime
+
+# 无 SDPA 融合(对照组)
+chrome.exe --no-sandbox --enable-features=WebMachineLearningNeuralNetwork \
+  --disable-features=WebNNDirectML,WebNNOnnxRuntime,ApplySdpaFusion
+```
+
+两组其余参数(GPU device、模型、页面)保持完全一致,只有这一个 feature
+的差异。
+
+### 2. 精确计时——Chrome 内置 tracing,`webnn` category
+
+WebNN 自带 Perfetto trace(`services/webnn/public/cpp/webnn_trace.cc:14`
+category 叫 `"webnn"`),`graph_impl_litert.cc` 里每次 `Dispatch` 都会打
+一个 `"Run inference"` step(`:403`),正好是 SDPA 融合影响到的那段
+耗时,且已经排除了 `"Acquire resources"`(`:843`)/
+`"Set up input and output buffers"`(`:373`)这些非计算开销。命令行直接
+录制成文件,不用手动点 chrome://tracing:
+
+```
+chrome.exe --no-sandbox --enable-features=WebMachineLearningNeuralNetwork \
+  --disable-features=WebNNDirectML,WebNNOnnxRuntime \
+  --trace-startup=webnn --trace-startup-file=trace_with_sdpa.json
+```
+
+跑完若干轮推理后关闭浏览器(trace 在进程退出或 buffer 满时落盘),把
+`.json` 拖进 https://ui.perfetto.dev,搜索 `"Run inference"`,看这个
+slice 的 duration 分布。两组(有/无 `ApplySdpaFusion`)各跑一遍,对比
+同一个 step 名字的耗时。
+
+### 3. 跑测注意事项
+
+- **跑够轮数**:SD-Turbo 每次生成会多次调用 UNet(每个 timestep 一次),
+  第一次调用通常包含 LiteRT 编译/delegate 下发的一次性开销,建议看第
+  2 轮之后的稳定值,或者直接看多次 `"Run inference"` slice 的中位数
+  而不是均值。
+- **确认 delegate 真的认领了 composite**:如果 ML Drift/XNNPACK 没认领
+  `STABLEHLO_COMPOSITE`(比如遇到不支持的 shape),会静默跑
+  decomposition 子图里的未融合算子,这种情况下两组耗时应该几乎没差别
+  ——如果测出来没有任何提升,先加 `--vmodule=*litert*=1,*webnn*=1` 确认
+  GPU 日志里没有 fallback 警告。
+- **同一硬件、同一轮次对齐**:UNet 每个 timestep 都会触发一次
+  `Dispatch`,对比时要确保两组统计的是同一个阶段(比如都是第 3 个
+  timestep 之后),不要把冷启动的那一轮也算进去。
+
 ## 相关文件
 
 - `services/webnn/tflite/graph_builder_tflite.h` / `.cc`(chromium 仓库,
@@ -300,3 +552,5 @@ ml-drift WebGPU 回读默认 10 秒超时(这个模型在集显上要 ~19.5 秒)
 - `tflite-dump-model/stable_diffusion/` —— vae_decoder_no_sdpa.tflite /
   vae_decoder_fused_sdpa.tflite / parse_vae.py(log)。
 - `sd/SDPA_FUSION_REVIEW.zh.md` —— 实现 review 与验证全记录。
+- `tflite-dump-model/stable_diffusion/no_weights_model/unet.tflite` ——
+  UNet 多头扩展的诊断样本(skip-weights dump,结构完整、权重为空)。
