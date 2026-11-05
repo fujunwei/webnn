@@ -164,12 +164,45 @@ All chrome processes peak (sum) : 24902.7 MB
 | | 修复前 | 修复后 | 变化 |
 |---|---|---|---|
 | GPU 进程峰值 | 13278 MB | 8477~8943 MB | **-4.3~-4.8 GB（-33%~-36%）** |
-| 渲染进程峰值 | 16105 MB | 15734~16729 MB | **基本不变** |
+| 渲染进程峰值**工作集** | 16105 MB | 15734~16729 MB | 基本不变（**但这个口径看不出 arena 修复，见下**） |
 | GPU + 最大渲染进程 | 29383 MB | 24211~25672 MB | -3.7~-5.2 GB |
 
-- buffer 存储有效地降低了 **GPU 进程**的内存，但**渲染进程的峰值没变，始终在 15.7~16.7 GB**。
-- 第一次 OOM 的渲染进程 pid 19924，**正是 11-04 09:42 OOM dump 里那个进程**，其峰值 16.7 GB 紧贴 PartitionAlloc 单池 16 GiB 的上限。这印证了问题 B 是独立于 A 的。
-- 脚本的 `PeakMB` 口径我没确认（疑为 PeakWorkingSet），不同于 dump 里的 private commit（19.85 GiB），不要直接对比两个口径。
+- buffer 存储有效地降低了 **GPU 进程**的内存。
+- **口径更正 [实测，2026-11-05]**：`chrome-peak-memory.ps1` 读的是 `PeakWorkingSet64`（常驻页）。TFLite arena 是"提交了但从未写入"的内存，**不进工作集，只占提交量（commit）**；而渲染进程里映射的权重文件（约 3.6 GiB）是文件映射页，进工作集、不进 commit、也不占 PartitionAlloc 池。所以**"渲染进程工作集没变"不能当作"buffer/arena 修复无效"或"问题 B 与 A 无关"的证据**，上面把它当证据的表述作废。
+- OOM 的判据是 **commit**（dump 里 private 16.8~19.9 GiB，池上限 16 GiB），应当看 `PeakPagedMemorySize64` / `PrivateMemorySize64`。新增脚本 `peak_memory\chrome-peak-commit.ps1` 同时输出 commit 和工作集。
+- 第一次 OOM 的渲染进程 pid 19924 正是 11-04 09:42 OOM dump 里的进程。
+
+#### A.3.2 加入 `ReleaseMemory` 补丁（`stablehlo_composite.cc`）后的验证 [实测]
+
+补丁：`Prepare` 末尾在 `!ShouldPreserveAllTensors()` 时对 decomposition subgraph 调 `ReleaseMemory()`；`Eval_static` 开头重新 `AllocateTensors()`。
+
+| 项 | 结果 |
+|---|---|
+| runner：VAE 存活的大 arena | 30 个 → **0 个** |
+| runner：VAE 私有 commit | 8.85 GiB → **2.00 GiB** |
+| runner：VAE 输出 | 与补丁前一致 |
+| runner：text_encoder（走 composite 的 Eval 路径） | `--verify` **PASS** |
+| Chrome（unetbatch=2，生成成功）渲染进程 | **峰值 commit 12.5 GB**（`chrome-peak-commit.ps1`），当前 commit 4.4 GB，峰值工作集 15.4 GB；活的渲染进程里没有 512/256 MiB 的 arena 块 |
+
+**对照（同一脚本 `chrome-peak-commit.ps1`，用户提供的"优化之前"一次运行）[用户实测]：**
+
+| 渲染进程 | 优化前 (pid 22056) | 补丁后 (pid 10468) | 变化 |
+|---|---|---|---|
+| 峰值 commit | 15312 MB | 12504 MB | -2.8 GB |
+| **生成完后的当前 commit** | **12942 MB** | **4387 MB** | **-8.6 GB** |
+| 峰值工作集 | 16500 MB | 15414 MB | -1.1 GB（基本不变） |
+| GPU 进程峰值 commit | 12116 MB | 7252 MB | -4.9 GB（这里含 buffer 存储的效果） |
+
+- **当前 commit 少 8.6 GB 是最清楚的信号**：优化前 arena 一直占着（约 6.8 GiB 以上），补丁后已释放。这与 runner 的结果一致（VAE 8.85→2.00 GiB）。
+- 峰值 commit 只降了 2.8 GB，**小于 arena 总量**：峰值可能出现在别的阶段（如 unet 编译 / 权重拷贝），或补丁下每个 composite 的 arena 仍会在 `Prepare` 里短暂存在（逐个释放，同一时刻只有一个）。具体原因**未验证**。
+- 两次运行是否同配置（unetbatch、是否 buffer 存储）我没有核实，只当作一次对照，不是严格 A/B。
+- 优化前 15.3 GB 的峰值 commit 已接近 16 GiB 池上限（OOM 的前提），补丁后余量约 3.9 GB。
+
+- 12.5 GB 对比之前 5 个 OOM dump 的 16.8~19.9 GiB 私有提交，离 16 GiB 池上限多约 4 GB 余量。**这是一致的迹象，不是对照实验**（dump 是崩溃时，这次是一次正常跑完，条件不同；只跑了一次）。
+- **没有直接证明 Chrome 二进制含补丁**（`chrome.dll` 是同步过来的，时间戳不可靠）；只有间接证据：没有 arena 大块，且 GPU 进程仍持有 ~6.5 GiB，模型未被销毁。
+- **未解释**：渲染进程峰值 commit 12.5 GB 由什么组成、何时出现。推测主要是 unet 编译的主机侧内存加上 JS/ORT 的权重副本，**未验证**。需要时间线（`C:\temp\sd_runner\renderer_mem.ps1 -Seconds 2`）。
+- 未测：`Eval_dynamic` 路径；VAE 在 CPU 参考（`--verify`）下曾 OOM 崩溃（0xE0000008），原因推断为 CPU 参考路径本身，**未证明与补丁无关**。
+- 仍待：PTL（18 GB）上单 Tab / 多开空 Tab / 静置三种场景。
 
 ### A.4 验证步骤（待 PTL）
 
@@ -330,7 +363,9 @@ aligned_realloc
 
 **风险汇总**：要改 TFLite（补丁很小，约 2 行，但需要维护）；builder 侧改动面不小（CAST、常量、两处 CHECK）；收益只有一半（VAE 约 3.5 GiB）；GPU 不接 composite 时回退会报错（仅在这种少见情况下）；ML Drift 是否接受 FP16 的 group_norm 输入未验证。
 
-### 方案 2：不给不会被执行的分解体子图常驻 arena（**已打补丁，待真机验证**）
+### 方案 2：不给不会被执行的分解体子图常驻 arena（**已打补丁；runner 与 Chrome 已验证，PTL 待验证**）
+
+> **验证结果见 A.3.2**：runner 里 VAE arena 30→0、commit 8.85→2.00 GiB、输出一致、text_encoder `--verify` PASS；Chrome 渲染进程生成后当前 commit 12942→4387 MB（峰值 commit 15312→12504 MB）。未测：`Eval_dynamic`、CPU 回退连续两次 Invoke、PTL。
 
 - 预期收益最大：runner 里 VAE 约 6.84 GiB（全部）；渲染进程按 dump 里的块大小估计约 3.4～6.8 GiB。
 - **TFLite 本身已经在做"用完即放"，只是 `Prepare` 漏了** [读码]（`kernels/stablehlo_composite.cc`）：
@@ -350,7 +385,7 @@ aligned_realloc
 - **为什么不在 LiteRT 层调 `Interpreter::ReleaseNonPersistentMemory()`（原设想）**：① `CompiledModel` 不暴露 interpreter，要改 LiteRT 内部；② 释放后 `Eval_static` 不会重新分配，CPU 回退时会报 `Invoke called on model that is not ready`。
 - **顺带修掉的潜在 bug** [读码，未实测]：原代码 `Eval` 末尾释放了 arena，但 `Eval_static` 不重新分配 → composite 在 CPU 上执行时，**第二次 Invoke 就可能失败**。补丁在 `Eval_static` 开头加的 `AllocateTensors()` 同时修了这个问题。
 - 代价：仅在 CPU 真正执行分解体时，每次 `Eval` 多一次子图重规划（GPU 接管时为 0）。
-- 风险 / 待验证：输出逐元素一致（`--verify`）；CPU 回退下连续推理 ≥2 次正常；GPU 侧 `IsFullyAccelerated` 不变。
+- 风险 / 待验证：VAE 输出逐元素一致（CPU 参考 `--verify` 曾 OOM，只对比了输出一致/统计量）；CPU 回退下连续推理 ≥2 次正常；GPU 侧 `IsFullyAccelerated` 不变。
 
 ### 方案 3：打开 PartitionAlloc 的 `tighter_aligned_alloc_bound`
 
